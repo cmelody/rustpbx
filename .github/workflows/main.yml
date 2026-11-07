@@ -1,0 +1,25 @@
+name: Auto Sync Upstream
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 每天北京时间早上 8:00（UTC 0点）自动运行
+  workflow_dispatch:     # 允许你在网页端手动点击按钮同步
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull upstream changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/restsend/rustpbx.git
+          git fetch upstream
+          git checkout main || git checkout master
+          git merge upstream/main || git merge upstream/master
+          git push origin HEAD
