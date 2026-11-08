@@ -24,6 +24,7 @@ use crate::{
     config::{ProxyConfig, RecordingPolicy},
     config_store::GeneratedConfigStore,
     models::{routing, sip_trunk},
+    proxy::nat::NatInspector,
     proxy::queue_files::{self as queue_files},
     proxy::routing::matcher::RouteResourceLookup,
     proxy::routing::{
@@ -37,6 +38,9 @@ pub struct ProxyDataContext {
     config: RwLock<Arc<ProxyConfig>>,
     pub trunks: DashMap<String, TrunkConfig>,
     pub acl_inbound_trunks: ArcSwap<JointPrefixMap<IpNet, Vec<String>>>,
+    /// SIP NAT inspector whose trunk exception list is rebuilt on every
+    /// trunk reload.
+    nat_inspector: NatInspector,
     pub queues: DashMap<String, RouteQueueConfig>,
     routes: RwLock<Vec<RouteRule>>,
     acl_rules: RwLock<Vec<String>>,
@@ -78,6 +82,7 @@ impl ProxyDataContext {
             config: RwLock::new(config.clone()),
             trunks: DashMap::new(),
             acl_inbound_trunks: ArcSwap::from_pointee(JointPrefixMap::new()),
+            nat_inspector: NatInspector::new(config.nat_fix),
             queues: DashMap::new(),
             routes: RwLock::new(Vec::new()),
             acl_rules: RwLock::new(Vec::new()),
@@ -161,6 +166,10 @@ impl ProxyDataContext {
             }
         }
         matched
+    }
+
+    pub fn nat_inspector(&self) -> &NatInspector {
+        &self.nat_inspector
     }
 
     pub fn routes_snapshot(&self) -> Vec<RouteRule> {
@@ -301,7 +310,7 @@ impl ProxyDataContext {
     /// Try to parse a trunk `dest` field into an `IpNet` for ACL inbound matching.
     /// Handles bare IP, IP:port, CIDR, and `sip:`/`sips:` prefixed variants.
     /// Returns `None` for hostnames (no DNS resolution during config reload).
-    fn dest_to_ipnet(dest: &str) -> Option<IpNet> {
+    pub(crate) fn dest_to_ipnet(dest: &str) -> Option<IpNet> {
         let dest = dest.trim().trim_matches(|c| c == '<' || c == '>');
         let dest = dest
             .strip_prefix("sip:")
@@ -511,6 +520,7 @@ impl ProxyDataContext {
             self.trunks.insert(k.clone(), v.clone());
         }
         self.acl_inbound_trunks.store(Arc::new(acl_inbound_trunks));
+        self.nat_inspector.update_trunks(&trunks);
 
         let acl_enabled = config
             .modules
@@ -860,16 +870,6 @@ impl ProxyDataContext {
             finished_at,
             duration_ms,
         })
-    }
-
-    pub fn set_acl_rules(&self, mut rules: Vec<String>) {
-        if rules.is_empty() {
-            rules = vec!["allow all".to_string(), "deny all".to_string()];
-        }
-
-        let total = rules.len();
-        *self.acl_rules.write().unwrap() = rules;
-        info!(total = total, "acl rules snapshot updated at runtime");
     }
 
     async fn export_trunks_to_toml(
@@ -1299,6 +1299,17 @@ pub fn sbc_config_from_metadata(meta: &serde_json::Value) -> TrunkConfig {
         external_ip: from_str(sbc.and_then(|s| s.get("external_ip"))),
         bind_ip: from_str(sbc.and_then(|s| s.get("bind_ip"))),
         ice_lite: from_bool(sbc.and_then(|s| s.get("ice_lite"))),
+        passthrough_custom_sdp_attrs: from_bool(
+            sbc.and_then(|s| s.get("passthrough_custom_sdp_attrs")),
+        ),
+        nat_fix: from_bool(sbc.and_then(|s| s.get("nat_fix"))),
+        retry_policy: sbc
+            .and_then(|s| s.get("retry_policy"))
+            .and_then(|v| serde_json::from_value::<super::routing::RetryPolicy>(v.clone()).ok())
+            .filter(|policy| policy.validate().is_ok()),
+        diversion_headers: from_bool(sbc.and_then(|s| s.get("diversion_headers"))),
+        history_info: from_bool(sbc.and_then(|s| s.get("history_info"))),
+        max_ring_time: from_u64(sbc.and_then(|s| s.get("max_ring_time"))),
         codec: codecs,
         recording: if recording.is_some() { recording } else { None },
         ..Default::default()
@@ -1329,6 +1340,7 @@ pub fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
     // Base trunk config
     let mut trunk = TrunkConfig {
         dest,
+        outbound_proxy: backup_dest.clone(),
         backup_dest,
         username: model.auth_username,
         password: model.auth_password,
@@ -1336,6 +1348,10 @@ pub fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
         disabled: Some(!model.is_active),
         max_calls: model.max_concurrent.map(|v| v as u32),
         max_cps: model.max_cps.map(|v| v as u32),
+        max_call_duration: model
+            .max_call_duration
+            .filter(|secs| *secs > 0)
+            .map(|secs| secs as u32),
         weight: None,
         transport,
         id: Some(model.id),
@@ -1425,6 +1441,18 @@ pub fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
             }
             if sbc.ice_lite.is_some() {
                 trunk.ice_lite = sbc.ice_lite;
+            }
+            if sbc.passthrough_custom_sdp_attrs.is_some() {
+                trunk.passthrough_custom_sdp_attrs = sbc.passthrough_custom_sdp_attrs;
+            }
+            if sbc.nat_fix.is_some() {
+                trunk.nat_fix = sbc.nat_fix;
+            }
+            if sbc.retry_policy.is_some() {
+                trunk.retry_policy = sbc.retry_policy;
+            }
+            if sbc.max_ring_time.is_some() {
+                trunk.max_ring_time = sbc.max_ring_time;
             }
         }
     }
@@ -2501,6 +2529,125 @@ file = "db://ivr/lf-step-ivr.generated.toml"
         assert_eq!(trunk.ice_lite, None);
     }
 
+    /// Console-managed trunks store the custom-SDP-attribute pass-through
+    /// switch in `metadata.sbc.passthrough_custom_sdp_attrs` (no dedicated
+    /// column): the parsed value must surface on the trunk config, absent →
+    /// None (pass-through enabled by default).
+    #[test]
+    fn convert_trunk_merges_sbc_passthrough_custom_sdp_attrs() {
+        let model = sip_trunk::Model {
+            id: 1,
+            name: "strict".to_string(),
+            sip_server: Some("sip:1.2.3.4:5060".to_string()),
+            metadata: Some(serde_json::json!({"sbc": {"passthrough_custom_sdp_attrs": false}})),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        assert_eq!(trunk.passthrough_custom_sdp_attrs, Some(false));
+
+        let model = sip_trunk::Model {
+            id: 2,
+            name: "plain".to_string(),
+            sip_server: Some("sip:1.2.3.4:5060".to_string()),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        assert_eq!(trunk.passthrough_custom_sdp_attrs, None);
+    }
+
+    /// Source and destination trunks merge with AND semantics: a single
+    /// disabled trunk strips custom SDP attributes for the whole call.
+    #[test]
+    fn merge_trunk_media_hints_and_semantics_for_custom_sdp_attrs() {
+        use crate::proxy::routing::matcher::merge_trunk_media_hints;
+        use crate::proxy::routing::TrunkConfig;
+
+        let disabled = TrunkConfig {
+            passthrough_custom_sdp_attrs: Some(false),
+            ..Default::default()
+        };
+        let enabled = TrunkConfig {
+            passthrough_custom_sdp_attrs: Some(true),
+            ..Default::default()
+        };
+
+        // Default: pass-through enabled.
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &enabled);
+        assert_eq!(hints.as_ref().unwrap().passthrough_custom_sdp_attrs, Some(true));
+
+        // Source disabled + destination enabled → disabled.
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &disabled);
+        merge_trunk_media_hints(&mut hints, &enabled);
+        assert_eq!(hints.as_ref().unwrap().passthrough_custom_sdp_attrs, Some(false));
+
+        // Source enabled + destination disabled → disabled.
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &enabled);
+        merge_trunk_media_hints(&mut hints, &disabled);
+        assert_eq!(hints.as_ref().unwrap().passthrough_custom_sdp_attrs, Some(false));
+
+        // Both enabled → enabled.
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &enabled);
+        merge_trunk_media_hints(&mut hints, &enabled);
+        assert_eq!(hints.as_ref().unwrap().passthrough_custom_sdp_attrs, Some(true));
+    }
+
+    #[test]
+    fn convert_trunk_keeps_registrar_dest_and_outbound_proxy_apart() {
+        let model = sip_trunk::Model {
+            id: 3,
+            name: "via-sbc".to_string(),
+            sip_server: Some("sip:registrar.carrier.example".to_string()),
+            outbound_proxy: Some("sbc.carrier.example:5060".to_string()),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        assert_eq!(trunk.dest, "sip:registrar.carrier.example");
+        assert_eq!(trunk.outbound_proxy.as_deref(), Some("sbc.carrier.example:5060"));
+
+        // Proxy alone becomes the destination itself, not a separate proxy.
+        let model = sip_trunk::Model {
+            id: 4,
+            name: "proxy-only".to_string(),
+            outbound_proxy: Some("sbc.carrier.example".to_string()),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        assert_eq!(trunk.dest, "sbc.carrier.example");
+        assert_eq!(trunk.outbound_proxy, None);
+    }
+
+    #[test]
+    fn convert_trunk_merges_retry_policy_without_schema_fields() {
+        let model = sip_trunk::Model {
+            id: 3,
+            name: "carrier".to_string(),
+            sip_server: Some("sip:1.2.3.4:5060".to_string()),
+            metadata: Some(serde_json::json!({"sbc": {
+                "ice_lite": true,
+                "max_ring_time": 20,
+                "retry_policy": {"status_codes": [408, 503]}
+            }})),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        let policy = trunk.retry_policy.as_ref().expect("policy should be merged");
+        assert_eq!(policy.status_codes, vec![408, 503]);
+        assert_eq!(trunk.max_ring_time, Some(20));
+        assert_eq!(trunk.ice_lite, Some(true));
+
+        let encoded = toml::to_string(&trunk).expect("serialize trunk config");
+        let decoded: TrunkConfig = toml::from_str(&encoded).expect("read trunk config");
+        assert_eq!(decoded.retry_policy, trunk.retry_policy);
+        assert!(sbc_config_from_metadata(&serde_json::json!({})).retry_policy.is_none());
+        assert!(sbc_config_from_metadata(&serde_json::json!({"sbc": {
+            "retry_policy": {"status_codes": [200]}
+        }})).retry_policy.is_none());
+    }
+
     #[test]
     fn convert_trunk_no_ringback_without_sbc_metadata() {
         let model = sip_trunk::Model {
@@ -2512,6 +2659,41 @@ file = "db://ivr/lf-step-ivr.generated.toml"
         };
         let (_, trunk) = convert_trunk(model).expect("should convert");
         assert!(trunk.ringback.is_none(), "no metadata → no ringback");
+    }
+
+    /// The `max_call_duration` column reaches the trunk; 0 means no limit.
+    #[test]
+    fn convert_trunk_maps_max_call_duration() {
+        let model = |secs| sip_trunk::Model {
+            id: 1,
+            name: "limited".to_string(),
+            sip_server: Some("sip:203.0.113.52:5060".to_string()),
+            max_call_duration: secs,
+            ..Default::default()
+        };
+        let limit = |secs| {
+            convert_trunk(model(secs))
+                .expect("should convert")
+                .1
+                .max_call_duration
+        };
+        assert_eq!(limit(Some(3600)), Some(3600));
+        assert_eq!(limit(Some(0)), None);
+        assert_eq!(limit(None), None);
+    }
+
+    /// `metadata.sbc.nat_fix` (no dedicated column) must reach the trunk.
+    #[test]
+    fn convert_trunk_merges_sbc_nat_fix() {
+        let model = sip_trunk::Model {
+            id: 1,
+            name: "nat-trunk".to_string(),
+            sip_server: Some("sip:203.0.113.52:5060".to_string()),
+            metadata: Some(serde_json::json!({"sbc": {"nat_fix": false}})),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).unwrap();
+        assert_eq!(trunk.nat_fix, Some(false));
     }
 
     #[test]

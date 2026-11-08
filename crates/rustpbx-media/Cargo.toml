@@ -1,6 +1,6 @@
 [package]
 name = "rustpbx-media"
-version = "0.5.1"
+version = "0.5.2-rc"
 edition = "2024"
 description = "RustPBX component: media"
 license = "MIT"
@@ -9,17 +9,19 @@ repository = "https://github.com/restsend/rustpbx"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1.88"
-audio-codec = "0.4.7"
+audio-codec = "0.4.13"
 bytes = { version = "1", features = ["serde"] }
 dashmap = "6"
 minimp3 = "0.6.1"
+mp4 = "0.14.0"
 parking_lot = "0.12"
 rand = "0.10"
-rustpbx-http-util = { path = "../rustpbx-http-util", version = "0.5.1" }
-rustpbx-sipflow = { path = "../rustpbx-sipflow", version = "0.5.1" }
-rustpbx-record-common = { path = "../rustpbx-record-common", version = "0.5.1" }
-rustrtc = "0.4.3"
+rustpbx-http-util = { path = "../rustpbx-http-util", version = "0.5.2-rc" }
+rustpbx-sipflow = { path = "../rustpbx-sipflow", version = "0.5.2-rc" }
+rustpbx-record-common = { path = "../rustpbx-record-common", version = "0.5.2-rc" }
+rustrtc = "0.6.0"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1.53", features = ["fs", "io-util", "sync"] }
 tokio-util = "0.7.18"
 tokio-stream = "0.1"
@@ -29,6 +31,7 @@ url = "2.5.8"
 [dev-dependencies]
 tokio = { version = "1.53", features = ["test-util"] }
 tempfile = "3.27.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = "0.5"
 chrono = "0.4"
 

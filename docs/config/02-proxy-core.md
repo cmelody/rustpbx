@@ -168,7 +168,10 @@ enable_latching = true
 # when enable_latching = true)
 latching_probation_max_packets = 6
 
-# Enable NAT fix for SIP signaling
+# Enable NAT fix for SIP signaling: on a received INVITE/REGISTER (and 1xx/2xx
+# INVITE responses), a Contact with a private IP is rewritten to the observed
+# source address. A trunk's own `nat_fix` overrides this for messages from
+# that trunk's addresses.
 nat_fix = true
 ```
 
@@ -219,6 +222,7 @@ In this mode, the following config types are written to and loaded from the `con
 | CC Skill Groups | `cc_skill_groups` | `skill_groups.generated.toml` |
 | CC Agents | `cc_agents` | `agents.generated.toml` |
 | CC Transfer | `cc_transfer` | `transfer.toml` |
+| CC Phone breaks/behavior | `cc_phone` | `phone.generated.toml` |
 
 > **Note**: There is no migration path between modes. Switching from filesystem to DB mode (or vice versa) requires re-exporting all configs through the admin console.
 

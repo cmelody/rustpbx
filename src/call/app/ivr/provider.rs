@@ -332,26 +332,33 @@ impl ResumeEventMode {
 /// by `/step` URL for the process lifetime: one legacy endpoint must not
 /// cost every subsequent resumed call a failed round-trip, while distinct
 /// endpoints (multi-tenant) keep their own verdict.
-static RESUME_DOWNGRADED_ENDPOINTS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
-    std::sync::Mutex::new(None);
+///
+/// Classification: process-global **business state**, deliberately shared
+/// across all [`StepProvider`] instances so the fuse survives per-call
+/// provider recreation. Bounded by the number of distinct `/step` URLs in
+/// config (never grows per call). Injection candidate if provider lifetime
+/// ever becomes config-scoped; not per-call state.
+static RESUME_DOWNGRADED_ENDPOINTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 fn resume_downgraded_for(url: &str) -> bool {
     match RESUME_DOWNGRADED_ENDPOINTS.lock() {
-        Ok(guard) => guard.as_ref().is_some_and(|set| set.contains(url)),
+        Ok(set) => set.contains(url),
         Err(_) => false,
     }
 }
 
 fn mark_resume_downgraded(url: &str) {
-    if let Ok(mut guard) = RESUME_DOWNGRADED_ENDPOINTS.lock() {
-        guard.get_or_insert_with(Default::default).insert(url.to_string());
+    if let Ok(mut set) = RESUME_DOWNGRADED_ENDPOINTS.lock() {
+        set.insert(url.to_string());
     }
 }
 
 #[cfg(test)]
 pub(crate) fn reset_resume_downgrades_for_test() {
-    if let Ok(mut guard) = RESUME_DOWNGRADED_ENDPOINTS.lock() {
-        *guard = None;
+    if let Ok(mut set) = RESUME_DOWNGRADED_ENDPOINTS.lock() {
+        set.clear();
     }
 }
 
@@ -485,6 +492,23 @@ impl StepProvider {
                 }
                 Err(e) => {
                     let elapsed = start.elapsed();
+                    // A 4xx (except 408/429) is a deterministic rejection —
+                    // e.g. 409 Conflict when the endpoint already holds
+                    // session state. Retrying cannot change the outcome and
+                    // only leaves the caller in dead air; fail fast so the
+                    // session-level IVR fallback can take over.
+                    let client_error = e
+                        .downcast_ref::<crate::http_util::HttpStatusError>()
+                        .is_some_and(|s| s.is_client_error());
+                    if client_error {
+                        error!(
+                            url = %url,
+                            error = %e,
+                            duration_ms = %elapsed.as_millis(),
+                            "{label} rejected with deterministic client error; not retrying"
+                        );
+                        return Err(e);
+                    }
                     last_err = e;
                     error!(
                         url = %url,
@@ -597,22 +621,55 @@ impl ActionProvider for StepProvider {
     async fn on_session_start(&self, ctx: &SessionContext) -> anyhow::Result<()> {
         let url = self.endpoint_url(Some("start"));
         let start = std::time::Instant::now();
-        let req = self.http_client.post(&url).json(ctx);
-        if let Err(e) = crate::http_util::execute_request(req, &self.headers, None).await {
-            error!(
-                url = %url,
-                error = %e,
-                duration_ms = %start.elapsed().as_millis(),
-                "StepProvider on_session_start failed"
-            );
-        } else {
-            debug!(
-                url = %url,
-                duration_ms = %start.elapsed().as_millis(),
-                "StepProvider on_session_start response"
-            );
+        // Keep the existing startup budget; retries share it rather than borrowing
+        // /step's shorter timeout or extending the caller's initialization wait.
+        let deadline = tokio::time::Instant::now() + crate::http_util::effective_timeout(None);
+        let mut last_err = anyhow::anyhow!("no retry attempted");
+        for attempt in 0..self.retry.max_retries {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let req = self.http_client.post(&url).json(ctx);
+            match crate::http_util::execute_request(req, &self.headers, Some(remaining)).await {
+                Ok(_) => {
+                    debug!(
+                        session_id = %ctx.session_id,
+                        app_execution_id = ctx.app_execution_id,
+                        url = %url,
+                        duration_ms = %start.elapsed().as_millis(),
+                        "StepProvider on_session_start response"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(
+                        session_id = %ctx.session_id,
+                        app_execution_id = ctx.app_execution_id,
+                        url = %url,
+                        error = %err,
+                        attempt = attempt,
+                        duration_ms = %start.elapsed().as_millis(),
+                        "StepProvider on_session_start failed"
+                    );
+                    // Only transport failures are recoverable here. A provider
+                    // response remains authoritative and keeps its original error.
+                    if err
+                        .downcast_ref::<crate::http_util::HttpStatusError>()
+                        .is_some()
+                    {
+                        return Err(err);
+                    }
+                    last_err = err;
+                }
+            }
+            if attempt + 1 < self.retry.max_retries {
+                let wake =
+                    tokio::time::Instant::now() + Duration::from_millis(self.retry.retry_delay_ms);
+                tokio::time::sleep_until(wake.min(deadline)).await;
+            }
         }
-        Ok(())
+        Err(last_err)
     }
 
     async fn on_session_end_context(
@@ -781,5 +838,112 @@ mod tests {
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("detail"));
+    }
+
+    // ── Retry policy: deterministic 4xx must fail fast ─────────────────
+
+    fn probe_ctx() -> ProviderContext {
+        ProviderContext {
+            session_id: "retry-test-session".into(),
+            app_execution_id: 1,
+            caller: "sip:1001@test".into(),
+            callee: "39230".into(),
+            direction: "inbound".into(),
+            tenant_id: None,
+            ivr_id: None,
+            variables: HashMap::new(),
+            sip_headers: None,
+            event: Some(ProviderEvent::SessionStart),
+            route_name: None,
+            custom_data: None,
+            step_start_time: None,
+            step_end_time: None,
+            step_duration_ms: None,
+            step_index: Some(0),
+            transferred_from: None,
+        }
+    }
+
+    fn fast_retry() -> RetryConfig {
+        RetryConfig {
+            max_retries: 3,
+            timeout_ms: 1000,
+            retry_delay_ms: 1,
+            fallback_action: None,
+        }
+    }
+
+    /// Spawn a mock `/step` endpoint returning `status` on every request,
+    /// counting hits. Returns (url, hit-count handle).
+    async fn spawn_status_endpoint(
+        status: axum::http::StatusCode,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_for_handler = hits.clone();
+        let app = axum::Router::new().route(
+            "/step",
+            axum::routing::post(move || {
+                let hits = hits_for_handler.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    status
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        crate::utils::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}/step"), hits)
+    }
+
+    #[tokio::test]
+    async fn client_error_409_fails_fast_without_retry() {
+        // Production regression: the endpoint answers 409 Conflict when it
+        // already holds the session state. Retrying cannot change the
+        // outcome — the old behavior burned the full retry budget (~2s of
+        // caller dead air) before failing anyway.
+        let (url, hits) = spawn_status_endpoint(axum::http::StatusCode::CONFLICT).await;
+        let provider = StepProvider::new(url, reqwest::Client::new()).with_retry(fast_retry());
+
+        let err = provider.next_action(probe_ctx()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("409"),
+            "expected 409 in error, got: {err}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "4xx must be attempted exactly once — no retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_error_410_fails_fast_without_retry() {
+        // 410 Gone on a plain (non-resume-probe) step: also deterministic.
+        let (url, hits) = spawn_status_endpoint(axum::http::StatusCode::GONE).await;
+        let provider = StepProvider::new(url, reqwest::Client::new()).with_retry(fast_retry());
+
+        let err = provider.next_action(probe_ctx()).await.unwrap_err();
+        assert!(err.to_string().contains("410"), "got: {err}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn server_error_still_exhausts_retry_budget() {
+        // Guard the over-correction: 5xx remains transient and keeps the
+        // full retry budget.
+        let (url, hits) = spawn_status_endpoint(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let provider = StepProvider::new(url, reqwest::Client::new()).with_retry(fast_retry());
+
+        let err = provider.next_action(probe_ctx()).await.unwrap_err();
+        assert!(err.to_string().contains("500"), "got: {err}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "5xx should use the full retry budget"
+        );
     }
 }

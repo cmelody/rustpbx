@@ -16,7 +16,7 @@
 //! sources to the always-alive [`EgressPipeline`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -24,7 +24,7 @@ use audio_codec::CodecType;
 use parking_lot::Mutex;
 use rustrtc::{
     IceServer, IceTransportPolicy, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
-    SessionDescription, TransportMode,
+    SessionDescription,
     config::BufferDropStrategy,
     media::MediaKind,
     media::track::sample_track,
@@ -34,11 +34,15 @@ use tokio::sync::{broadcast, oneshot};
 use tracing::debug;
 
 use crate::egress::{EgressCodec, EgressPipeline, EgressSource};
+use crate::amd;
+use crate::inband_dtmf;
+use crate::inband_dtmf::InbandDtmfMode;
+use crate::pcm_analysis_tap::{AnalysisSinkKind, PcmAnalysisTap, PcmBlockSink};
 use crate::ingress_tap::{DtmfEvent, IngressTap, TapStats};
 use crate::leg_id::LegId;
 use crate::leg_stats::{LegRtcpStats, SrTimeTracker, spawn_rtcp_listener};
 use crate::media_recorder::RecorderSender;
-use crate::negotiate::{self, CodecInfo, NegotiatedLegProfile};
+use crate::negotiate::{self, CodecInfo, NegotiatedLegProfile, TransportMode};
 
 /// Outcome of a [`PlaybackHandle`]'s play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +84,8 @@ fn dtmf_event_duration_for_clock(clock_rate: u32) -> u16 {
 /// Configuration for creating a [`Leg`]'s PeerConnection.
 #[derive(Clone)]
 pub struct LegConfig {
+    pub volume_stats: crate::volume_stats::VolumeStatsConfig,
+    pub quality_stats: crate::quality_stats::QualityStatsConfig,
     pub transport: TransportMode,
     /// Codec preference (first entry is offered/used for the egress sender).
     pub codecs: Vec<CodecInfo>,
@@ -87,8 +93,15 @@ pub struct LegConfig {
     /// leg carries no video (audio-only call).
     pub video_codecs: Vec<rustrtc::config::VideoCapability>,
     pub rtp_port_range: Option<(u16, u16)>,
-    pub external_ip: Option<String>,
-    pub bind_ip: Option<String>,
+    /// Public addresses to advertise instead of the local ones (1:1 NAT),
+    /// at most one per family (rustrtc `external_ips`).
+    pub external_ips: Vec<std::net::IpAddr>,
+    /// Local addresses to bind on, one socket each; `::` is one socket for
+    /// IPv4 and IPv6 (rustrtc `bind_ips`). Empty: chosen by rustrtc.
+    pub bind_ips: Vec<std::net::IpAddr>,
+    /// Our offers on RTP and SRTP legs put IPv6 in `c=` when the leg has it
+    /// (rustrtc `prefer_ipv6`). Answers follow the offer's family.
+    pub prefer_ipv6: bool,
     pub cname: Option<String>,
     /// Emit comfort noise (instead of digital silence) when the leg's egress
     /// has no source. Defaults to true.
@@ -104,12 +117,11 @@ pub struct LegConfig {
     /// handshake (see `dialplan.media.relay_only`). Defaults to false.
     pub relay_only: bool,
     /// Advertise `a=ice-lite` in this leg's offer/answer SDP (rustrtc
-    /// `enable_ice_lite`). The leg runs as a Controlled ICE-lite agent:
+    /// `Connectivity::IceLite`). The leg runs as a Controlled ICE-lite agent:
     /// it starts no connectivity checks and answers the remote full-ICE
-    /// peer's checks. Only applied in `TransportMode::Rtp` — WebRTC legs
-    /// always run full ICE and Srtp legs ignore the flag (rustrtc
-    /// limitation), so `build_rtc_config` forces it off for those modes.
-    /// Defaults to false.
+    /// peer's checks. Applied in `TransportMode::Rtp` and `Srtp` — WebRTC
+    /// legs always run full ICE, so `build_rtc_config` forces it off for
+    /// them. Defaults to false.
     pub enable_ice_lite: bool,
     /// Enable symmetric-RTP latching on plain RTP/SRTP legs: egress follows
     /// the address the remote peer actually sends from, instead of the
@@ -127,6 +139,18 @@ pub struct LegConfig {
     /// media/ICE log lines carry the call id (session id). `None` renders as
     /// "-" in rustrtc logs.
     pub call_id: Option<String>,
+    /// In-band audio DTMF detection policy for this leg. `Auto` (default)
+    /// runs the Goertzel detector whenever the leg negotiates NO
+    /// telephone-event; `on` forces it alongside RFC 2833; `off` disables it.
+    pub inband_dtmf: InbandDtmfMode,
+    /// Per-leg inbound-RTP stall watcher threshold in seconds (see
+    /// `crate::ingress_stall`). When a leg that HAS received media goes
+    /// silent this long, the watcher logs a WARN and publishes an
+    /// [`crate::ingress_stall::IngressStallEvent`] for the session to report
+    /// as `proxy.ingress_stalled`. `0` disables the watcher. Defaults to 10.
+    pub ingress_stall_warn_secs: u64,
+    /// Logical call root; the local call_id remains independently searchable.
+    pub root_session_id: Option<String>,
 }
 
 impl LegConfig {
@@ -143,8 +167,9 @@ impl LegConfig {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: None,
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
@@ -155,6 +180,11 @@ impl LegConfig {
             probation_max_packets: None,
             relay_ready_timeout: None,
             call_id: None,
+            inband_dtmf: InbandDtmfMode::Auto,
+            ingress_stall_warn_secs: crate::ingress_stall::DEFAULT_INGRESS_STALL_WARN_SECS,
+            root_session_id: None,
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
         }
     }
 }
@@ -207,6 +237,25 @@ pub struct LegInner {
     /// RTCP-derived quality (jitter / RTT / fraction lost) plus the remote SR
     /// packet count, updated lock-free by the RTCP listener task(s).
     rtcp_stats: Arc<LegRtcpStats>,
+    /// Inbound-RTP stall watcher plumbing: event stream for the session
+    /// forwarder, the configured threshold (0 = watcher disabled), the
+    /// cancel token tripped by `stop`, and the task handle (aborted on
+    /// stop). See `crate::ingress_stall`.
+    ingress_stall_tx: broadcast::Sender<crate::ingress_stall::IngressStallEvent>,
+    ingress_stall_warn_secs: AtomicU64,
+    ingress_stall_cancel: tokio_util::sync::CancellationToken,
+    ingress_stall_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set by the session while inbound silence is EXPECTED on this leg —
+    /// currently only while the leg is on hold (we sent a sendonly
+    /// re-INVITE, so the peer legitimately stops sending). Distinct from
+    /// [`RtpTimeoutState::active`], which merely tracks whether the RTP
+    /// inactivity timeout is armed: an un-armed timeout is the NORMAL call
+    /// state, and must not suppress stall detection.
+    ingress_quiet_expected: Arc<std::sync::atomic::AtomicBool>,
+    /// Session-side forwarder arming guard: several call phases may try to
+    /// spawn the CDR forwarder for the same leg; this keeps exactly one
+    /// subscriber task (and therefore exactly one CDR edge) per leg.
+    ingress_stall_forwarder_armed: AtomicBool,
     /// Handles of the per-leg RTCP listener tasks, aborted on `stop` / `Drop`.
     rtcp_listener_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Outbound DTMF (RFC 2833) send state: the RTP payload type used for
@@ -214,10 +263,61 @@ pub struct LegInner {
     /// after a profile is negotiated (`dtmf_pt` set); until then `send_dtmf`
     /// is a no-op.
     dtmf_send: parking_lot::Mutex<DtmfSendState>,
+    /// In-band audio DTMF policy (`Auto`/`on`/`off`), fixed at construction
+    /// from `LegConfig` and resolved against every negotiated profile.
+    inband_dtmf_mode: AtomicU8,
+    /// DTMF sink bookkeeping: the codec "key" its sink was built for and how
+    /// many times it was (re)created. The sink itself lives in the shared
+    /// analysis tap's registry.
+    inband_dtmf: parking_lot::Mutex<InbandDtmfState>,
+    /// The leg's single shared ingress-audio analysis tap (in-band DTMF +
+    /// AMD sinks). Created only while at least one analyser wants audio.
+    analysis: parking_lot::Mutex<AnalysisState>,
+    /// Armed AMD analysis (survives tap rebuilds: the detector lives in a
+    /// shared slot, only the transport is recreated on codec changes).
+    amd: parking_lot::Mutex<AmdState>,
     /// Comfort-noise settings, preserved so `update_codec` (re-INVITE codec
     /// switch) rebuilds the egress codec with the same CNG behaviour.
     comfort_noise: bool,
     comfort_noise_level_db: f32,
+}
+
+/// DTMF sink bookkeeping on the shared analysis tap.
+#[derive(Default)]
+struct InbandDtmfState {
+    /// `(audio payload_type, clock_rate)` the DTMF sink was built for
+    /// (`None` when the policy does not want detection).
+    key: Option<(u8, u32)>,
+    /// How many times a DTMF sink was (re)created (diagnostics + tests
+    /// observe re-INVITE rebuilds without reaching into the tap itself).
+    generation: u64,
+}
+
+/// The leg's single shared analysis tap. Exists only while at least one
+/// analyser wants ingress audio — legs that never ask (RFC 2833 negotiated,
+/// no AMD) run with no observer and no decode task at all.
+#[derive(Default)]
+struct AnalysisState {
+    tap: Option<crate::pcm_analysis_tap::PcmAnalysisTap>,
+    /// `(audio payload_type, clock_rate)` the running tap decodes for.
+    key: Option<(u8, u32)>,
+    /// Whether the running tap was built with the DTMF / AMD sinks.
+    dtmf_sink: bool,
+    amd_sink: bool,
+}
+
+/// Armed AMD analysis on this leg.
+#[derive(Default)]
+struct AmdState {
+    /// Shared detector slot (`None` = not armed). Kept across tap rebuilds
+    /// so analysis state survives re-INVITE codec changes.
+    slot: Option<crate::amd::SharedDetector>,
+    local_speech: Option<Arc<AtomicBool>>,
+    outcome_tx: Option<tokio::sync::mpsc::Sender<crate::amd::AmdVerdict>>,
+    /// Codec key the AMD sink was (last) built for.
+    key: Option<(u8, u32)>,
+    /// How many times an AMD sink was (re)created.
+    generation: u64,
 }
 
 /// Outbound RFC 2833 telephone-event send state.
@@ -278,6 +378,21 @@ impl Default for RtpTimeoutState {
 
 /// A single media leg. Cheaply cloneable (`Arc<LegInner>`).
 pub type Leg = Arc<LegInner>;
+
+/// Initial recording-capture routing for a leg's tap, chosen at construction.
+/// Dynamic retargeting later (hold, recording start/stop) goes through
+/// [`Leg::ingress_tap`] → [`crate::ingress_tap::IngressTap::set_capture_route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRoute {
+    /// Classic caller layout: ingress→Caller, egress→Callee. With no recorder
+    /// sender installed, capture stays off regardless of the route.
+    Classic,
+    /// Starts fully off. Used for non-owner legs (callee/B, consult peers):
+    /// while bridged the caller leg's egress owns the B channel, and a second
+    /// live source would interleave into garbage. Hold routing flips the
+    /// ingress channel on for as long as the leg is the held peer.
+    Deferred,
+}
 
 impl LegInner {
     /// Create a leg from a pre-built [`RtcConfiguration`] (so callers can
@@ -452,8 +567,18 @@ impl LegInner {
             relay_arm_task: Mutex::new(None),
             relay_ready_timeout,
             rtcp_stats,
+            ingress_stall_tx: broadcast::channel(8).0,
+            ingress_stall_warn_secs: std::sync::atomic::AtomicU64::new(0),
+            ingress_stall_cancel: tokio_util::sync::CancellationToken::new(),
+            ingress_stall_task: Mutex::new(None),
+            ingress_stall_forwarder_armed: std::sync::atomic::AtomicBool::new(false),
+            ingress_quiet_expected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rtcp_listener_tasks: Mutex::new(rtcp_listener_tasks),
             dtmf_send: parking_lot::Mutex::new(DtmfSendState::default()),
+            inband_dtmf_mode: AtomicU8::new(InbandDtmfMode::Auto.to_u8()),
+            inband_dtmf: parking_lot::Mutex::new(InbandDtmfState::default()),
+            analysis: parking_lot::Mutex::new(AnalysisState::default()),
+            amd: parking_lot::Mutex::new(AmdState::default()),
             comfort_noise,
             comfort_noise_level_db,
         }))
@@ -494,7 +619,7 @@ impl LegInner {
         cfg: &LegConfig,
         recorder_sender: Option<RecorderSender>,
     ) -> Result<Leg> {
-        Self::from_rtc_config(
+        let leg = Self::from_rtc_config(
             id,
             build_rtc_config(cfg),
             cfg.codecs.clone(),
@@ -502,7 +627,65 @@ impl LegInner {
             cfg.comfort_noise_level_db,
             cfg.relay_ready_timeout,
             recorder_sender,
-        )
+        )?;
+        leg.inband_dtmf_mode
+            .store(cfg.inband_dtmf.to_u8(), Ordering::SeqCst);
+        if cfg.quality_stats.enabled {
+            leg.tap.enable_audio_packet_samples();
+        }
+        leg.egress.set_volume_stats(
+            cfg.volume_stats.enabled,
+            cfg.quality_stats.clone(),
+            cfg.call_id.as_ref().map(|session_id| (session_id.clone(), leg.id().to_string())),
+        )?;
+        // Inbound-RTP stall watcher: threshold arrives via LegConfig (0 =
+        // disabled). Spawning here — after the tap/PC exist — keeps the
+        // whole watcher lifecycle inside the leg (aborted on `stop`), and
+        // `from_rtc_config` callers (existing tests) keep the watcher off.
+        leg.ingress_stall_warn_secs.store(
+            cfg.ingress_stall_warn_secs,
+            std::sync::atomic::Ordering::Release,
+        );
+        if cfg.ingress_stall_warn_secs > 0 {
+            let handle = crate::ingress_stall::spawn_ingress_watch(
+                leg.id.to_string(),
+                leg.pc.clone(),
+                Arc::clone(&leg.tap),
+                Arc::clone(&leg.rtcp_stats),
+                leg.ingress_stall_tx.clone(),
+                Duration::from_secs(cfg.ingress_stall_warn_secs),
+                leg.ingress_stall_cancel.clone(),
+                Arc::clone(&leg.rtp_timeout),
+                Arc::clone(&leg.ingress_quiet_expected),
+            );
+            *leg.ingress_stall_task.lock() = Some(handle);
+        }
+        Ok(leg)
+    }
+
+    /// Subscribe to inbound-RTP stall edges (`stalled` / `resumed`) for this
+    /// leg. The session forwards `stalled` edges to the CDR/RWI error path
+    /// as `proxy.ingress_stalled` (once per leg).
+    pub fn subscribe_ingress_stall(
+        &self,
+    ) -> broadcast::Receiver<crate::ingress_stall::IngressStallEvent> {
+        self.ingress_stall_tx.subscribe()
+    }
+
+    /// Arm the session-side CDR forwarder for this leg. Returns `false` when
+    /// a forwarder was already armed (multiple call phases call this); the
+    /// loser skips spawning so each leg produces exactly one CDR edge.
+    pub fn arm_ingress_stall_forwarder(&self) -> bool {
+        !self
+            .ingress_stall_forwarder_armed
+            .swap(true, Ordering::AcqRel)
+    }
+
+    /// Tell the stall watcher that inbound silence is expected on this leg
+    /// (hold) — see [`LegInner::ingress_quiet_expected`].
+    pub fn set_ingress_quiet_expected(&self, expected: bool) {
+        self.ingress_quiet_expected
+            .store(expected, Ordering::Release);
     }
 
     pub fn id(&self) -> &LegId {
@@ -523,6 +706,29 @@ impl LegInner {
         self.negotiated.lock().clone()
     }
 
+    /// Build a local description for hold/resume without re-offering unused audio codecs.
+    pub fn negotiated_local_sdp(&self) -> Option<SessionDescription> {
+        let mut local = self.pc.local_description()?;
+        if let Some(profile) = self.negotiated()
+            && let Some(codec) = &profile.audio
+            && let Some(audio) = local.media_sections.iter_mut()
+                .find(|section| section.kind == rustrtc::MediaKind::Audio && section.port != 0)
+        {
+            let mut payloads = profile.dtmf_pts();
+            payloads.insert(codec.payload_type);
+            audio.formats.retain(|pt| pt.parse::<u8>().is_ok_and(|pt| payloads.contains(&pt)));
+            audio.attributes.retain(|attr| {
+                if matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb")
+                    && let Some(pt) = attr.value.as_deref().and_then(|v| v.split_whitespace().next())
+                {
+                    return pt == "*" || audio.formats.iter().any(|format| format == pt);
+                }
+                true
+            });
+        }
+        Some(local)
+    }
+
     /// Audio address this leg advertised in its local SDP (`addr:port` a
     /// remote peer would send media to), captured when the local description
     /// commits. Diagnostics anchor for media black-hole analysis.
@@ -535,8 +741,45 @@ impl LegInner {
         self.peer_advertised_addr.lock().clone()
     }
 
+    /// Audio address egress is actually sent to. Direct RTP/SDES legs read
+    /// the transport's live destination, which latching moves off the SDP
+    /// address; WebRTC legs use the ICE selected pair.
+    pub fn remote_media_addr(&self) -> Option<String> {
+        match self.direct_audio_transport() {
+            Some(transport) => Some(transport.ice_conn().remote_addr.read().to_string()),
+            None => self
+                .pc
+                .ice_transport()
+                .get_selected_pair()
+                .map(|pair| pair.remote.address.to_string()),
+        }
+    }
+
+    /// Plain RTP or SDES: direct UDP, where egress follows the latch.
+    pub fn is_direct_rtp(&self) -> bool {
+        matches!(
+            TransportMode::of(self.pc.config()),
+            TransportMode::Rtp | TransportMode::Srtp
+        )
+    }
+
+    fn direct_audio_transport(&self) -> Option<Arc<rustrtc::transports::rtp::RtpTransport>> {
+        if !self.is_direct_rtp() {
+            return None;
+        }
+        rtp_transport_for_kind(&self.pc, rustrtc::MediaKind::Audio)
+    }
+
     pub(crate) fn stats(&self) -> TapStats {
         self.tap.stats()
+    }
+
+    /// PCM already observed before encoding on this leg's egress.
+    pub(crate) fn volume_summary(
+        &self,
+        window: Duration,
+    ) -> Option<crate::volume_stats::VolumeSummary> {
+        self.egress.volume_summary(window)
     }
 
     /// RTCP-derived quality (jitter / RTT / fraction lost) for this leg.
@@ -577,6 +820,30 @@ impl LegInner {
     /// Create and commit an offer SDP (as UAC).
     pub async fn create_offer(&self) -> Result<String> {
         let offer = self.prepare_offer().await?;
+        let mut sdp = offer.to_sdp_string();
+        // rustrtc renders freshly added video transceivers as `m=video 0`
+        // without `a=rtcp-mux` even under `RtcpMuxPolicy::Require` — while
+        // BUNDLE groups the video m-line with a muxed audio one. Browser
+        // peers reject such an answer (`rtcp-mux must be enabled when BUNDLE
+        // is enabled`) → JsSIP replies 500. When this leg advertises video,
+        // finalize the m-line through the same renegotiation seam the rest
+        // of the session uses (port placeholder + mux posture restore).
+        if let Some(caps) = self
+            .pc
+            .config()
+            .media_capabilities
+            .as_ref()
+            .map(|caps| caps.video.as_slice())
+            .filter(|caps| !caps.is_empty())
+        {
+            sdp = negotiate::MediaNegotiator::rewrite_video_capabilities(
+                SdpType::Offer,
+                &sdp,
+                caps,
+            )?;
+        }
+        let offer = SessionDescription::parse(SdpType::Offer, &sdp)
+            .map_err(|e| anyhow!("failed to reparse rewritten offer: {e:?}"))?;
         let sdp = set_local(&self.pc, offer)?;
         if let Some(desc) = self.pc.local_description()
             && let Some(addr) = advertised_audio_addr(&desc)
@@ -584,22 +851,36 @@ impl LegInner {
             *self.advertised_addr.lock() = Some(addr);
         }
         debug!(
+            session_id = %self.pc.config().label.as_deref().unwrap_or_default(),
             leg = %self.id,
-            sdp = ?sdp,
+            sdp_bytes = sdp.len(),
+            transport = ?TransportMode::of(self.pc.config()),
             "leg SDP offer created",
         );
         Ok(sdp)
     }
 
-    /// Apply a remote SDP (offer or answer) and return the local SDP to send
-    /// back (an answer when `sdp_type == Offer`, or empty when applying an
-    /// answer as UAC). Also extracts and stores the negotiated profile and
-    /// refreshes the egress codec + DTMF payload types.
-    pub async fn apply_sdp(&self, remote: &str, sdp_type: SdpType) -> Result<String> {
+    /// Apply the peer's SDP. Answers update the negotiated RTP profile.
+    /// Offers leave the local answer to prepare_answer and commit_local_answer.
+    pub async fn apply_remote_sdp(&self, remote: &str, sdp_type: SdpType) -> Result<()> {
+        let video_mline = SessionDescription::parse(sdp_type, remote).ok().and_then(|desc| {
+            desc.media_sections
+                .iter()
+                .find(|section| section.kind == rustrtc::MediaKind::Video)
+                .map(|section| {
+                    format!(
+                        "port={} dir={:?} fmts={:?}",
+                        section.port, section.direction, section.formats
+                    )
+                })
+        });
         debug!(
+            session_id = %self.pc.config().label.as_deref().unwrap_or_default(),
             leg = %self.id,
             sdp_type = ?sdp_type,
-            sdp = ?remote,
+            sdp_bytes = remote.len(),
+            transport = ?TransportMode::of(self.pc.config()),
+            video_mline = ?video_mline,
             "leg SDP applied",
         );
         let desc = SessionDescription::parse(sdp_type, remote)
@@ -607,8 +888,8 @@ impl LegInner {
         if let Some(addr) = advertised_audio_addr(&desc) {
             *self.peer_advertised_addr.lock() = Some(addr);
         }
-        self.pc
-            .set_remote_description(desc)
+        // Keep rustrtc's large negotiation future off the nested SIP call stack.
+        Box::pin(self.pc.set_remote_description(desc))
             .await
             .map_err(|e| anyhow!("set_remote_description failed: {}", e))?;
         // Direct RTP has a transport now; WebRTC may still be waiting for ICE.
@@ -622,8 +903,8 @@ impl LegInner {
         // direct UDP like plain RTP and their SRTP packets keep the clear
         // RTP header, so latching works identically there. WebRTC legs
         // resolve their address via ICE and are excluded.
-        if (self.pc.config().transport_mode == rustrtc::TransportMode::Rtp
-            || self.pc.config().transport_mode == rustrtc::TransportMode::Srtp)
+        if (TransportMode::of(self.pc.config()) == TransportMode::Rtp
+            || TransportMode::of(self.pc.config()) == TransportMode::Srtp)
             && self.pc.config().enable_latching
         {
             for transceiver in self.pc.get_transceivers() {
@@ -635,35 +916,22 @@ impl LegInner {
             }
         }
 
-        let local_sdp = if sdp_type == SdpType::Offer {
-            // rustrtc gathering pattern: the first create_answer primes ICE
-            // gathering; wait for candidates, then the second includes them.
-            // RTP mode returns instantly; WebRTC/SRTP need the wait.
-            let _ = self.pc.create_answer().await?;
-            self.pc.wait_for_gathering_complete().await;
-            let mut answer = self.pc.create_answer().await?;
-            answer.sdp_type = SdpType::Answer;
-            let local = set_local(&self.pc, answer)?;
-            if let Some(desc) = self.pc.local_description()
-                && let Some(addr) = advertised_audio_addr(&desc)
-            {
-                *self.advertised_addr.lock() = Some(addr);
-            }
-            local
-        } else {
-            // Applying a remote answer (UAC): no local SDP to emit.
-            String::new()
-        };
+        if sdp_type != SdpType::Offer {
+            self.sync_answer_profile(remote, remote).await?;
+        }
+        Ok(())
+    }
 
-        // R1 fix: sync the sender's codec/PT to the negotiated answer.
-        // Extract the profile from the answer SDP: the local answer we just
-        // produced (as UAS), or the remote answer we applied (as UAC).
-        let profile_sdp = if local_sdp.is_empty() {
-            remote
-        } else {
-            local_sdp.as_str()
-        };
-        let profile = negotiate::MediaNegotiator::extract_leg_profile(profile_sdp);
+    /// Build a draft answer to the applied remote offer, ready for editing.
+    pub async fn prepare_answer(&self) -> Result<SessionDescription> {
+        // The first create_answer starts ICE gathering. The second includes its candidates.
+        let _ = self.pc.create_answer().await?;
+        self.pc.wait_for_gathering_complete().await;
+        Ok(self.pc.create_answer().await?)
+    }
+
+    async fn sync_answer_profile(&self, answer: &str, remote: &str) -> Result<()> {
+        let profile = negotiate::MediaNegotiator::extract_leg_profile(answer);
 
         self.sync_negotiated_profile(&profile).await?;
 
@@ -679,12 +947,14 @@ impl LegInner {
             self.tap.set_dtmf_payload_types(all_pts);
         }
 
-        Ok(local_sdp)
+        Ok(())
     }
 
     /// Convenience: apply a remote offer and produce an answer.
     pub async fn answer(&self, remote_offer: &str) -> Result<String> {
-        self.apply_sdp(remote_offer, SdpType::Offer).await
+        self.apply_remote_sdp(remote_offer, SdpType::Offer).await?;
+        let answer = self.prepare_answer().await?;
+        self.commit_local_answer(&answer.to_sdp_string(), SdpType::Answer).await
     }
 
     async fn sync_negotiated_profile(&self, profile: &NegotiatedLegProfile) -> Result<()> {
@@ -730,6 +1000,7 @@ impl LegInner {
         }
 
         *self.negotiated.lock() = Some(profile.clone());
+        self.tap.set_recording_profile(profile.clone());
         // DTMF telephone-event payload types → tap. Listen on ALL negotiated
         // telephone-event PTs (a WebRTC peer may send DTMF on any of them, e.g.
         // the 8 kHz PT for browsers), not just the single preferred `dtmf`.
@@ -758,11 +1029,279 @@ impl LegInner {
         let mut dtmf = self.dtmf_send.lock();
         dtmf.dtmf_pt = profile.dtmf.as_ref().map(|d| d.payload_type);
         dtmf.dtmf_clock_rate = profile.dtmf.as_ref().map(|d| d.clock_rate).unwrap_or(8000);
+        drop(dtmf);
+        // Shared analysis tap policy: start/stop/swap the audio analysers
+        // (in-band DTMF, AMD) for this profile (every SDP apply — including
+        // re-INVITEs — lands here).
+        self.apply_analysis_policy(profile);
         Ok(())
     }
 
+    /// Resolve the leg's shared analysis tap against the freshly negotiated
+    /// profile. The tap exists only while at least one analyser wants ingress
+    /// audio — a leg with RFC 2833 negotiated and no AMD armed runs with no
+    /// observer and no decode task at all:
+    ///
+    /// - **in-band DTMF** (`Auto`/`on`/`off` policy): `Auto` wants detection
+    ///   exactly when NO telephone-event was negotiated; `on` always (with
+    ///   audio); `off` never.
+    /// - **AMD**: wanted while armed via [`Self::arm_amd`] (session arms at
+    ///   answer time).
+    ///
+    /// A codec change (PT or clock) rebuilds the tap: the DTMF sink restarts
+    /// (same as the old dedicated-tap behaviour), the AMD sink carries its
+    /// detector across so analysis state survives re-INVITEs. An unwanted tap
+    /// is dropped synchronously (`Drop` deactivates its observer and cancels
+    /// the decode task).
+    fn apply_analysis_policy(&self, profile: &NegotiatedLegProfile) {
+        let mode = InbandDtmfMode::from_u8(self.inband_dtmf_mode.load(Ordering::SeqCst));
+        let want_dtmf = match mode {
+            InbandDtmfMode::Off => false,
+            InbandDtmfMode::Auto => {
+                profile.audio.is_some() && profile.dtmf_pts().is_empty()
+            }
+            InbandDtmfMode::AlwaysOn => profile.audio.is_some(),
+        };
+        let codec_key = profile
+            .audio
+            .as_ref()
+            .map(|a| (a.payload_type, a.clock_rate));
+        let session_id = self.pc.config().label.as_deref().unwrap_or_default();
+
+        // Lock order everywhere: analysis → inband_dtmf → amd.
+        let mut analysis = self.analysis.lock();
+        let mut dtmf_state = self.inband_dtmf.lock();
+        let mut amd = self.amd.lock();
+        let want_amd = amd.slot.is_some() && profile.audio.is_some();
+
+        // Same codec as the running tap: adjust sinks in place so an
+        // unrelated sink change (AMD arm/disarm) never disturbs DTMF state.
+        if analysis.tap.is_some() && codec_key.is_some() && analysis.key == codec_key {
+            let dtmf_changed = analysis.dtmf_sink != want_dtmf;
+            let amd_changed = analysis.amd_sink != want_amd;
+            {
+                let tap = analysis.tap.as_ref().expect("tap checked above");
+                if dtmf_changed {
+                    if want_dtmf {
+                        let audio = profile.audio.as_ref().expect("want_dtmf implies audio");
+                        tap.add_sink(inband_dtmf::make_sink(
+                            audio.codec.samplerate(),
+                            self.tap.dtmf_event_sender(),
+                            self.id.clone(),
+                        ));
+                        dtmf_state.generation += 1;
+                        dtmf_state.key = codec_key;
+                        debug!(
+                            session_id = %session_id,
+                            leg = %self.id, mode = ?mode,
+                            "in-band DTMF detection started",
+                        );
+                    } else {
+                        tap.remove_sink(AnalysisSinkKind::InbandDtmf);
+                        dtmf_state.key = None;
+                        debug!(
+                            session_id = %session_id,
+                            leg = %self.id, mode = ?mode,
+                            "in-band DTMF detection stopped",
+                        );
+                    }
+                }
+                if amd_changed {
+                    if want_amd {
+                        tap.add_sink(amd::make_sink(
+                            amd.slot.clone().expect("want_amd implies armed slot"),
+                            amd.local_speech
+                                .clone()
+                                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                            amd.outcome_tx
+                                .clone()
+                                .expect("armed AMD carries an outcome channel"),
+                        ));
+                        amd.generation += 1;
+                    } else {
+                        tap.remove_sink(AnalysisSinkKind::Amd);
+                    }
+                }
+            }
+            analysis.dtmf_sink = want_dtmf;
+            analysis.amd_sink = want_amd;
+            amd.key = if want_amd { codec_key } else { None };
+            if analysis.dtmf_sink || analysis.amd_sink {
+                return;
+            }
+            // Last sink gone → tear the tap down entirely.
+            analysis.tap.take();
+            analysis.key = None;
+            return;
+        }
+
+        // Codec changed (or no tap yet): full rebuild with the wanted sinks.
+        let mut sinks: Vec<(AnalysisSinkKind, Box<dyn PcmBlockSink>)> = Vec::new();
+        if want_dtmf {
+            let audio = profile.audio.as_ref().expect("want_dtmf implies audio");
+            sinks.push(inband_dtmf::make_sink(
+                audio.codec.samplerate(),
+                self.tap.dtmf_event_sender(),
+                self.id.clone(),
+            ));
+        }
+        if want_amd {
+            sinks.push(amd::make_sink(
+                amd.slot.clone().expect("want_amd implies armed slot"),
+                amd.local_speech
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                amd.outcome_tx
+                    .clone()
+                    .expect("armed AMD carries an outcome channel"),
+            ));
+        }
+
+        if sinks.is_empty() {
+            if analysis.tap.take().is_some() {
+                debug!(
+                    session_id = %session_id,
+                    leg = %self.id, mode = ?mode,
+                    "audio analysis tap stopped",
+                );
+            }
+            analysis.key = None;
+            analysis.dtmf_sink = false;
+            analysis.amd_sink = false;
+            dtmf_state.key = None;
+            amd.key = None;
+            return;
+        }
+
+        let Some(audio) = profile.audio.as_ref() else {
+            return;
+        };
+        match PcmAnalysisTap::attach(&self.pc, profile, self.id.clone(), sinks) {
+            Ok(tap) => {
+                debug!(
+                    session_id = %session_id,
+                    leg = %self.id,
+                    codec = ?audio.codec,
+                    payload_type = audio.payload_type,
+                    clock_rate = audio.clock_rate,
+                    dtmf = want_dtmf,
+                    amd = want_amd,
+                    "audio analysis tap started",
+                );
+                if want_dtmf {
+                    dtmf_state.generation += 1;
+                }
+                dtmf_state.key = if want_dtmf { codec_key } else { None };
+                if want_amd {
+                    amd.generation += 1;
+                }
+                amd.key = if want_amd { codec_key } else { None };
+                analysis.key = codec_key;
+                analysis.dtmf_sink = want_dtmf;
+                analysis.amd_sink = want_amd;
+                analysis.tap = Some(tap);
+            }
+            Err(error) => {
+                // Drop the stale tap too: it would decode the new codec's
+                // packets with the old decoder (garbage → phantom digits).
+                analysis.tap.take();
+                analysis.key = None;
+                analysis.dtmf_sink = false;
+                analysis.amd_sink = false;
+                dtmf_state.key = None;
+                amd.key = None;
+                tracing::warn!(
+                    session_id = %session_id,
+                    leg = %self.id, %error,
+                    "audio analysis tap attach failed",
+                );
+            }
+        }
+    }
+
+    /// Arm AMD analysis on this leg (the session calls this when the callee
+    /// answers). The detector slot survives re-INVITE tap rebuilds;
+    /// [`Self::disarm_amd`] releases it. Takes effect immediately when an
+    /// audio profile is already negotiated; otherwise the next profile apply
+    /// attaches the sink.
+    pub fn arm_amd(&self, armament: amd::AmdArmament) {
+        let slot: amd::SharedDetector =
+            Arc::new(parking_lot::Mutex::new(Some(armament.detector)));
+        {
+            let mut state = self.amd.lock();
+            state.slot = Some(slot);
+            state.local_speech = Some(armament.local_speech);
+            state.outcome_tx = Some(armament.outcome_tx);
+        }
+        if let Some(profile) = self.negotiated() {
+            self.apply_analysis_policy(&profile);
+        }
+    }
+
+    /// Disarm AMD analysis and remove its sink from the shared tap. The last
+    /// sink going away also tears the tap down.
+    pub fn disarm_amd(&self) {
+        {
+            let mut state = self.amd.lock();
+            if state.slot.take().is_none() {
+                return;
+            }
+            state.local_speech = None;
+            state.outcome_tx = None;
+            state.key = None;
+        }
+        if let Some(profile) = self.negotiated() {
+            self.apply_analysis_policy(&profile);
+        }
+    }
+
+    /// Whether AMD is currently armed on this leg (diagnostics / tests).
+    pub fn amd_armed(&self) -> bool {
+        self.amd.lock().slot.is_some()
+    }
+
+    /// How many times an AMD sink was (re)created on this leg.
+    pub fn amd_generation(&self) -> u64 {
+        self.amd.lock().generation
+    }
+
+    /// Notify the AMD detector that the local side started speaking (extra
+    /// Human evidence; optional v1 wiring).
+    pub fn notify_amd_local_speech(&self) {
+        if let Some(flag) = self.amd.lock().local_speech.as_ref() {
+            flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether the in-band audio DTMF detector is currently running on this
+    /// leg (diagnostics / tests).
+    pub fn inband_dtmf_active(&self) -> bool {
+        self.analysis.lock().dtmf_sink
+    }
+
+    /// How many times the in-band DTMF sink was (re)created on this leg.
+    /// Increments on every codec change; a stable value across re-INVITEs
+    /// means the same sink kept running.
+    pub fn inband_dtmf_generation(&self) -> u64 {
+        self.inband_dtmf.lock().generation
+    }
+
+    /// Commit the SIP answer after codec and direction selection, then use it for RTP.
+    pub async fn commit_local_answer(&self, sdp: &str, kind: SdpType) -> Result<String> {
+        let answer = set_local(&self.pc, SessionDescription::parse(kind, sdp)?)?;
+        if let Some(desc) = self.pc.local_description()
+            && let Some(addr) = advertised_audio_addr(&desc)
+        {
+            *self.advertised_addr.lock() = Some(addr);
+        }
+        self.refresh_observer();
+        let remote = self.pc.remote_description().map(|desc| desc.to_sdp_string()).unwrap_or_default();
+        self.sync_answer_profile(&answer, &remote).await?;
+        Ok(answer)
+    }
+
     /// Update the leg's negotiated profile and sender from an SDP built outside
-    /// [`Self::apply_sdp`], including peer-selected initial answers and
+    /// [`Self::answer`], including peer-selected initial answers and
     /// re-INVITEs. Keeps `MediaBridge::bridge()` and egress in sync with the
     /// SDP returned to the remote peer.
     pub async fn apply_profile_from_sdp(&self, sdp: &str) -> Result<()> {
@@ -794,7 +1333,10 @@ impl LegInner {
             EgressSource::TranscodePeer { .. } => "transcode_peer",
             EgressSource::Inject { .. } => "inject",
         };
-        tracing::debug!(leg = %self.id, source = kind, "leg egress source switch");
+        tracing::debug!(
+            session_id = %self.pc.config().label.as_deref().unwrap_or_default(),
+            leg = %self.id, source = kind, "leg egress source switch"
+        );
         let is_relay = matches!(&source, EgressSource::RewriteRelay { .. });
         if let Some(previous) = self.relay_arm_task.lock().take() {
             previous.abort();
@@ -823,8 +1365,8 @@ impl LegInner {
                 // defer the arming to a background task and return
                 // immediately. RTP-mode transports are created during SDP
                 // application and are ready synchronously.
-                let has_webrtc_peer = self.pc.config().transport_mode == TransportMode::WebRtc
-                    || peer_pc.config().transport_mode == TransportMode::WebRtc;
+                let has_webrtc_peer = TransportMode::of(self.pc.config()) == TransportMode::WebRtc
+                    || TransportMode::of(peer_pc.config()) == TransportMode::WebRtc;
                 let ready_timeout = self
                     .relay_ready_timeout
                     .unwrap_or(WEBRTC_RELAY_READY_TIMEOUT);
@@ -848,7 +1390,10 @@ impl LegInner {
                         )
                         .await
                         {
-                            tracing::warn!(leg = %leg_id, %error, "fast-path relay arming failed");
+                            tracing::warn!(
+                                session_id = %pc.config().label.as_deref().unwrap_or_default(),
+                                leg = %leg_id, %error, "fast-path relay arming failed"
+                            );
                             if let Some(cb) = on_arm_failed.as_ref() {
                                 cb();
                             }
@@ -873,9 +1418,25 @@ impl LegInner {
             _ if prev_was_relay => {
                 self.pc.clear_rtp_rewrite_bridge();
                 if let Some(sender) = audio_rtp_sender(&self.pc)
-                    && sender.packets_sent() > 0
+                    && let Some(wire_timestamp_high_water) = sender.rtp_timestamp_high_water()
                 {
-                    self.egress.adopt_wire_timestamp(sender.last_rtp_timestamp()).await?;
+                    // Adopt both the timestamp AND the sequence space: the
+                    // receiver has already consumed the relay's numbers on
+                    // this SSRC, and a sequence restart makes the paced
+                    // output look like stale retransmissions (dropped by
+                    // jitter buffers -> choppy/absent audio after hold).
+                    tracing::debug!(
+                        leg = %self.id,
+                        wire_ts = wire_timestamp_high_water,
+                        next_seq = sender.next_sequence_number(),
+                        "relay -> paced egress: adopting wire timeline"
+                    );
+                    self.egress
+                        .adopt_wire_timeline(
+                            wire_timestamp_high_water,
+                            sender.next_sequence_number(),
+                        )
+                        .await?;
                 }
             }
             _ => {}
@@ -896,13 +1457,14 @@ impl LegInner {
     pub fn quality_report(&self, side: &'static str) -> crate::leg_stats::LegQualityReport {
         let tap = self.stats();
         let rtcp = self.rtcp_stats().snapshot();
-        let remote_addr = self
-            .pc()
-            .ice_transport()
-            .get_selected_pair()
-            .map(|pair| pair.remote.address.to_string());
+        let remote_addr = self.remote_media_addr();
         crate::leg_stats::LegQualityReport {
             side,
+            pcm_egress: self.egress.recorded_volume().map(|volume| crate::leg_stats::PcmEgressWindow {
+                leg_id: self.id.to_string(),
+                egress_mode: crate::media_health::MediaEgressMode::PcmPacing,
+                volume,
+            }),
             codec: self.negotiated().and_then(|p| p.audio.map(|c| format!("{:?}", c.codec))),
             ingress_packets: tap.ingress_packets,
             egress_packets: tap.egress_packets,
@@ -1089,12 +1651,32 @@ impl LegInner {
         if let Some(tx) = state.fire_tx.lock().take() { let _ = tx.send(()); }
     }
 
+    /// Archive actual PCM through the terminal call boundary before its CDR is read.
+    pub async fn finalize_volume(&self) -> Result<()> {
+        self.egress.finalize_volume().await
+    }
+
     /// Stop the leg: cancel the egress pipeline and close the PeerConnection.
     /// Synchronous — safe to call from `Drop` (rustrtc close path has no
     /// tokio::spawn).
     pub fn stop(&self) {
         self.disarm_rtp_timeout();
         self.egress.stop();
+        // Tear the shared analysis tap down synchronously (Drop cancels its
+        // decode task and deactivates the packet observer).
+        {
+            let mut analysis = self.analysis.lock();
+            analysis.tap.take();
+            analysis.key = None;
+            analysis.dtmf_sink = false;
+            analysis.amd_sink = false;
+            self.inband_dtmf.lock().key = None;
+            self.amd.lock().key = None;
+        }
+        self.ingress_stall_cancel.cancel();
+        if let Some(handle) = self.ingress_stall_task.lock().take() {
+            handle.abort();
+        }
         if let Some(handle) = self.observer_task.lock().take() {
             handle.abort();
         }
@@ -1162,11 +1744,13 @@ fn seed_rewrite_options_from_destination(
     if options.initial_sequence_number.is_none() {
         options.initial_sequence_number = Some(sender.next_sequence_number());
     }
-    if options.initial_output_timestamp.is_none() && sender.packets_sent() > 0 {
+    if options.initial_output_timestamp.is_none()
+        && let Some(wire_timestamp_high_water) = sender.rtp_timestamp_high_water()
+    {
         let clock_rate = sender.params().clock_rate.max(1);
         let step = ((clock_rate as u64 * 20) / 1000) as u32;
         options.initial_output_timestamp =
-            Some(sender.last_rtp_timestamp().wrapping_add(step.max(1)));
+            Some(wire_timestamp_high_water.wrapping_add(step.max(1)));
     }
     options
 }
@@ -1238,9 +1822,9 @@ async fn wait_and_arm_rewrite_relay(
     video_payload_types: &[u8],
 ) -> Result<()> {
     let arm_started = std::time::Instant::now();
-    let webrtc_pc = if source_pc.config().transport_mode == TransportMode::WebRtc {
+    let webrtc_pc = if TransportMode::of(source_pc.config()) == TransportMode::WebRtc {
         Some(source_pc)
-    } else if destination_pc.config().transport_mode == TransportMode::WebRtc {
+    } else if TransportMode::of(destination_pc.config()) == TransportMode::WebRtc {
         Some(destination_pc)
     } else {
         None
@@ -1257,6 +1841,7 @@ async fn wait_and_arm_rewrite_relay(
                 )
             })??;
         tracing::debug!(
+            session_id = %source_pc.config().label.as_deref().unwrap_or_default(),
             leg = %leg,
             wait_ms = wait_started.elapsed().as_millis() as u64,
             "fast-path relay: WebRTC leg ready"
@@ -1274,6 +1859,7 @@ async fn wait_and_arm_rewrite_relay(
         let options = seed_rewrite_options_from_destination(destination_pc, rules, options);
         audio_source.bridge_rewrite_rules_to(audio_target, options, rules.to_vec());
         debug!(
+            session_id = %source_pc.config().label.as_deref().unwrap_or_default(),
             leg = %leg,
             video = false,
             arm_ms = arm_started.elapsed().as_millis() as u64,
@@ -1296,6 +1882,8 @@ async fn wait_and_arm_rewrite_relay(
         // non-BUNDLE destination needs the optional video dispatch target.
         let destination_is_non_bundle = !Arc::ptr_eq(&audio_target, &video_target);
         debug!(
+            session_id = %source_pc.config().label.as_deref().unwrap_or_default(),
+            leg = %leg,
             source_bundle = true,
             destination_bundle = !destination_is_non_bundle,
             video_payload_types = ?video_payload_types,
@@ -1318,6 +1906,8 @@ async fn wait_and_arm_rewrite_relay(
                     .is_some_and(|pt| video_payload_types.contains(&pt))
             });
         debug!(
+            session_id = %source_pc.config().label.as_deref().unwrap_or_default(),
+            leg = %leg,
             source_bundle = false,
             destination_bundle = Arc::ptr_eq(&audio_target, &video_target),
             audio_rules = audio_rules.len(),
@@ -1329,6 +1919,7 @@ async fn wait_and_arm_rewrite_relay(
     }
 
     debug!(
+        session_id = %source_pc.config().label.as_deref().unwrap_or_default(),
         leg = %leg,
         video = true,
         arm_ms = arm_started.elapsed().as_millis() as u64,
@@ -1338,26 +1929,16 @@ async fn wait_and_arm_rewrite_relay(
 }
 
 fn build_rtc_config(cfg: &LegConfig) -> RtcConfiguration {
-    let sdp_compatibility = match cfg.transport {
-        rustrtc::TransportMode::WebRtc => rustrtc::config::SdpCompatibilityMode::Standard,
-        rustrtc::TransportMode::Rtp | rustrtc::TransportMode::Srtp => {
-            rustrtc::config::SdpCompatibilityMode::LegacySip
-        }
-    };
     let (rtp_start_port, rtp_end_port) = cfg
         .rtp_port_range
         .map(|(start, end)| (Some(start), Some(end)))
         .unwrap_or((None, None));
     RtcConfiguration {
-        transport_mode: cfg.transport.clone(),
-        // ICE-lite only applies to plain-RTP legs; WebRTC must keep full ICE
-        // (browsers require connectivity checks + DTLS) and rustrtc only
-        // honors the flag on the Rtp path, so force it off for other modes.
-        enable_ice_lite: cfg.transport == TransportMode::Rtp && cfg.enable_ice_lite,
         rtp_start_port,
         rtp_end_port,
-        external_ip: cfg.external_ip.clone(),
-        bind_ip: cfg.bind_ip.clone(),
+        external_ips: cfg.external_ips.clone(),
+        bind_ips: cfg.bind_ips.clone(),
+        prefer_ipv6: cfg.prefer_ipv6,
         // Relay-only: advertise (and check) only TURN relay candidates. See
         // `LegConfig::relay_only` for when an operator wants this.
         ice_servers: cfg.ice_servers.clone(),
@@ -1374,13 +1955,6 @@ fn build_rtc_config(cfg: &LegConfig) -> RtcConfiguration {
         // SDP carries a private `c=` (e.g. Linphone without STUN).
         enable_latching: cfg.enable_latching,
         probation_max_packets: cfg.probation_max_packets,
-        // Plain SIP/RTP peers (and SDES-SRTP trunks) do not understand BUNDLE:
-        // they expect one distinct UDP port per m-line, no `a=rtcp-mux` and no
-        // `a=mid`. Without this a plain-RTP audio+video leg emits an offer with
-        // audio and video sharing a single port + rtcp-mux (WebRTC-style), which
-        // strict SIP video phones reject with 488 Not Acceptable Here. This
-        // mirrors the legacy `RtpTrackBuilder` path (rtp_track_builder.rs).
-        sdp_compatibility,
         // ICE pre-ready buffering: packets are buffered only until the RTP
         // transport is set up, and DropOldest means depth stays tiny in steady
         // state. 500 reserved ~5x the rustrtc default (100) and is almost never
@@ -1397,7 +1971,11 @@ fn build_rtc_config(cfg: &LegConfig) -> RtcConfiguration {
             application: None,
             image: vec![],
         }),
-        ..Default::default()
+        // RTP and SDES-SRTP legs: `RtcConfiguration::sip()`, a port per kind
+        // of media for peers without BUNDLE, RTCP multiplexing only when the
+        // peer offers or accepts it. ICE-lite applies to these legs only;
+        // WebRTC legs keep full ICE (browsers need connectivity checks).
+        ..cfg.transport.rtc_configuration(cfg.enable_ice_lite)
     }
 }
 
@@ -1429,7 +2007,11 @@ fn advertised_audio_addr(desc: &SessionDescription) -> Option<String> {
         .or(desc.session.connection.as_deref())?;
     // `c=IN IP4 1.2.3.4` → take the last token (the address).
     let host = conn.split_whitespace().next_back()?;
-    Some(format!("{host}:{}", audio.port))
+    match host.parse::<std::net::IpAddr>() {
+        // `[2001:db8::1]:4000` for IPv6.
+        Ok(ip) => Some(std::net::SocketAddr::new(ip, audio.port).to_string()),
+        Err(_) => Some(format!("{host}:{}", audio.port)),
+    }
 }
 
 pub(crate) fn set_local(pc: &PeerConnection, desc: SessionDescription) -> Result<String> {
@@ -1525,7 +2107,10 @@ mod relay_policy_tests {
 
     fn webrtc_cfg(relay_only: bool, ice_servers: Vec<IceServer>) -> LegConfig {
         LegConfig {
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             transport: TransportMode::WebRtc,
             codecs: vec![CodecInfo {
                 payload_type: 111,
@@ -1536,17 +2121,20 @@ mod relay_policy_tests {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: None,
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
+            inband_dtmf: Default::default(),
             relay_ready_timeout: None,
             ice_servers,
             relay_only,
             enable_ice_lite: false,
+            ingress_stall_warn_secs: 0,
         }
     }
 
@@ -1666,6 +2254,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_media_addr_follows_rtp_latch() {
+        let leg = LegInner::new("latch", &LegConfig::rtp_pcmu(), None).expect("leg");
+        let audio = test_rtp_transport().await;
+        set_test_sender_transport(leg.pc(), rustrtc::MediaKind::Audio, audio.clone());
+        assert_eq!(leg.remote_media_addr().as_deref(), Some("127.0.0.1:9"));
+
+        // What rustrtc's commit_latch does once the NAT'd source wins.
+        *audio.ice_conn().remote_addr.write() = "203.0.113.7:40000".parse().unwrap();
+        assert_eq!(leg.remote_media_addr().as_deref(), Some("203.0.113.7:40000"));
+    }
+
+    #[tokio::test]
     async fn relay_arming_requires_both_video_transports() {
         let mut config = LegConfig::rtp_pcmu();
         config.video_codecs = vec![rustrtc::config::VideoCapability::default()];
@@ -1730,18 +2330,46 @@ mod tests {
     async fn leg_config_network_settings_reach_rtc_configuration() {
         let mut cfg = LegConfig::rtp_pcmu();
         cfg.rtp_port_range = Some((46000, 46002));
-        cfg.external_ip = Some("203.0.113.10".to_string());
-        cfg.bind_ip = Some("127.0.0.1".to_string());
+        let ips = |list: &[&str]| -> Vec<std::net::IpAddr> {
+            list.iter().map(|ip| ip.parse().unwrap()).collect()
+        };
+        cfg.external_ips = ips(&["203.0.113.10", "2001:db8::10"]);
+        cfg.bind_ips = ips(&["127.0.0.1", "::1"]);
+        cfg.prefer_ipv6 = true;
         cfg.cname = Some("configured-cname".to_string());
 
         let leg = LegInner::new("configured-leg", &cfg, None).expect("configured RTP leg");
         let rtc = leg.pc().config();
         assert_eq!(rtc.rtp_start_port, Some(46000));
         assert_eq!(rtc.rtp_end_port, Some(46002));
-        assert_eq!(rtc.external_ip.as_deref(), Some("203.0.113.10"));
-        assert_eq!(rtc.bind_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(rtc.external_ips, ips(&["203.0.113.10", "2001:db8::10"]));
+        assert_eq!(rtc.bind_ips, ips(&["127.0.0.1", "::1"]));
+        assert!(rtc.prefer_ipv6);
         assert_eq!(rtc.cname.as_deref(), Some("configured-cname"));
         leg.stop();
+    }
+
+    /// The advertised media address in diagnostics: `[ip]:port` for IPv6.
+    #[test]
+    fn advertised_audio_addr_brackets_ipv6() {
+        let sdp = |c: &str| {
+            SessionDescription::parse(
+                SdpType::Offer,
+                &format!(
+                    "v=0\r\no=- 1 1 {c}\r\ns=-\r\nc={c}\r\nt=0 0\r\n\
+                     m=audio 4000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+                ),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            advertised_audio_addr(&sdp("IN IP6 2001:db8::1")).as_deref(),
+            Some("[2001:db8::1]:4000")
+        );
+        assert_eq!(
+            advertised_audio_addr(&sdp("IN IP4 192.0.2.1")).as_deref(),
+            Some("192.0.2.1:4000")
+        );
     }
 
     #[test]
@@ -1824,26 +2452,232 @@ mod tests {
 
     #[tokio::test]
     async fn leg_create_and_close_rtp() {
+        use std::collections::BTreeMap;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+        #[derive(Clone, Default)]
+        struct Logs {
+            volume: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+            relay: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+            sdp: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+        }
+        impl Subscriber for Logs {
+            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                #[derive(Default)]
+                struct Fields(BTreeMap<String, String>);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        self.0.insert(field.name().into(), format!("{value:?}"));
+                    }
+                }
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                if fields.0.get("message").is_some_and(|message| message == "PCM egress volume window") {
+                    self.volume.lock().push(fields.0);
+                } else if fields.0.get("message").is_some_and(|message|
+                    message == "leg egress source switch" || message == "fast-path relay armed")
+                {
+                    self.relay.lock().push(fields.0);
+                } else if fields.0.get("message").is_some_and(|message|
+                    message == "leg SDP offer created" || message == "leg SDP applied")
+                {
+                    self.sdp.lock().push(fields.0);
+                }
+            }
+        }
+        let logs = Logs::default();
+        let captured = logs.volume.clone();
+        let relay_logs = logs.relay.clone();
+        let sdp_logs = logs.sdp.clone();
+        // With a single live dispatcher, tracing-core caches a new callsite's
+        // interest from whichever thread hits it first; a parallel test with
+        // no subscriber then disables these debug! callsites for us too. A
+        // second live dispatcher forces interest to consider every dispatcher.
+        let _keep_interest = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _subscriber = tracing::subscriber::set_default(logs);
         // Two RTP legs bound to ephemeral ports must construct and stop
         // without panicking. Uses the loopback PC (no real network needed for
         // construction; add_track + observer are synchronous).
-        let a = LegInner::new("a", &LegConfig::rtp_pcmu(), None).expect("leg a");
+        let mut cfg = LegConfig::rtp_pcmu();
+        cfg.call_id = Some("pcm-session".into());
+        cfg.volume_stats.enabled = true;
+        cfg.quality_stats.sample_interval_ms = 250;
+        cfg.quality_stats.window_ms = 2000;
+        cfg.quality_stats.log_interval_ms = 500;
+        let a = LegInner::new("a", &cfg, None).expect("leg a");
         assert_eq!(a.id().as_str(), "a");
         assert!(a.negotiated().is_none());
         // Observer is installed: stats start at zero.
         assert_eq!(a.stats().ingress_packets, 0);
+        assert!(serde_json::to_value(a.quality_report("A")).unwrap()["pcmEgress"].is_null());
+        a.play(Box::new(crate::audio_source::ToneAudioSource::new(
+            440, Duration::from_secs(1), 8000,
+        ).unwrap()), true, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let report = serde_json::to_value(a.quality_report("A")).unwrap();
+        let observed = &report["pcmEgress"];
+        assert_eq!(observed["legId"], "a");
+        assert_eq!(observed["egressMode"], "pcm_pacing");
+        assert_eq!(observed["volume"]["measurement"], "pbx_pcm_pre_encode");
+        assert!(observed["volume"]["sample_count"].as_u64().unwrap() > 0);
+        assert!(observed["volume"]["rms"].as_f64().unwrap() > 0.0);
+        let rows = captured.lock();
+        let row = rows.last().expect("normal PCM owner must publish its completed window");
+        assert_eq!(row["session_id"], "pcm-session");
+        assert_eq!(row["leg_id"], "a");
+        assert_eq!(row["egress_mode"], "\"pcm_pacing\"");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&row["volume"]).unwrap(), observed["volume"]);
+        for pair in rows.windows(2) {
+            let earlier: serde_json::Value = serde_json::from_str(&pair[0]["volume"]).unwrap();
+            let later: serde_json::Value = serde_json::from_str(&pair[1]["volume"]).unwrap();
+            assert!(later["window_end_micros"].as_u64().unwrap()
+                - earlier["window_end_micros"].as_u64().unwrap() >= 500_000,
+                "PCM logs must follow the log interval rather than the sampling interval");
+        }
+        drop(rows);
+        a.stop_playback().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let completed = serde_json::to_value(a.quality_report("A")).unwrap()["pcmEgress"].clone();
+        assert!(completed["volume"]["window_end_micros"].as_u64().unwrap()
+            >= observed["volume"]["window_end_micros"].as_u64().unwrap());
+        a.play(Box::new(crate::audio_source::ToneAudioSource::new(
+            660, Duration::from_secs(1), 8000,
+        ).unwrap()), true, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        a.egress.set_source(EgressSource::RewriteRelay {
+            peer_pc: a.pc().clone(), options: Default::default(), rules: Vec::new(),
+            video_payload_types: Vec::new(), on_arm_failed: None,
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let direct = serde_json::to_value(a.quality_report("A")).unwrap()["pcmEgress"].clone();
+        assert!(direct["volume"]["observed_ms"].as_u64().unwrap() < 250);
+        assert!(a.volume_summary(Duration::from_secs(2)).is_none(),
+            "a parked direct source has no current PCM window");
+        let rows = captured.lock();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&rows.last().unwrap()["volume"]).unwrap(),
+            direct["volume"], "switching to direct forwarding must publish the short PCM window");
+        let count = rows.len();
+        drop(rows);
+        a.egress.set_source(EgressSource::RewriteRelay {
+            peer_pc: a.pc().clone(), options: Default::default(), rules: Vec::new(),
+            video_payload_types: Vec::new(), on_arm_failed: None,
+        }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(captured.lock().len(), count, "finishing again without PCM must not duplicate logs");
+        a.play(Box::new(crate::audio_source::ToneAudioSource::new(
+            660, Duration::from_secs(1), 8000,
+        ).unwrap()), true, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
         a.stop();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let partial = serde_json::to_value(a.quality_report("A")).unwrap()["pcmEgress"].clone();
+        assert!(partial["volume"]["window_end_micros"].as_u64().unwrap()
+            > direct["volume"]["window_end_micros"].as_u64().unwrap());
+        assert!(partial["volume"]["observed_ms"].as_u64().unwrap() < 250);
+        let rows = captured.lock();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&rows.last().unwrap()["volume"]).unwrap(),
+            partial["volume"], "closing before the next periodic emit must publish the final PCM window");
+        let count = rows.len();
+        drop(rows);
+        a.stop();
+        cfg.volume_stats.enabled = false;
+        let disabled = LegInner::new("disabled", &cfg, None).unwrap();
+        disabled.play(Box::new(crate::audio_source::ToneAudioSource::new(
+            440, Duration::from_secs(1), 8000,
+        ).unwrap()), true, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        disabled.finalize_volume().await.unwrap();
+        disabled.stop();
+        assert_eq!(captured.lock().len(), count, "disabled sampling and repeated stop must remain quiet");
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(serde_json::to_value(a.quality_report("A")).unwrap()["pcmEgress"], partial,
+            "teardown must retain the actual short PCM window after the live window expires");
+
+        // Real SDP/UDP setup followed by relay activation: the exported
+        // routing events must be searchable by the configured call identity.
+        let relay_a = LegInner::new("caller", &cfg, None).unwrap();
+        let relay_b = LegInner::new("callee", &cfg, None).unwrap();
+        let offer = relay_a.create_offer().await.unwrap();
+        let answer = relay_b.answer(&offer).await.unwrap();
+        relay_a.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+        relay_a.set_egress_source(EgressSource::RewriteRelay {
+            peer_pc: relay_b.pc().clone(), options: Default::default(), rules: Vec::new(),
+            video_payload_types: Vec::new(), on_arm_failed: None,
+        }).await.unwrap();
+        let rows = relay_logs.lock();
+        for message in ["leg egress source switch", "fast-path relay armed"] {
+            let row = rows.iter().rev().find(|row| row["message"] == message)
+                .expect("successful relay activation must emit its routing evidence");
+            assert_eq!(row.get("session_id").map(String::as_str), Some("pcm-session"),
+                "routing logs must carry the full call identity, not just caller/callee");
+            assert_eq!(row["leg"], "caller");
+        }
+        drop(rows);
+        relay_a.stop();
+        relay_b.stop();
+
+        // Exercise the actual SDP-producing/applying entrypoints with both
+        // credential-bearing transports, and inspect the emitted event fields.
+        for transport in [TransportMode::WebRtc, TransportMode::Srtp] {
+            let mut secure_cfg = LegConfig::rtp_pcmu();
+            secure_cfg.transport = transport;
+            secure_cfg.call_id = Some("secure-session".into());
+            secure_cfg.bind_ips = vec!["127.0.0.1".parse().unwrap()];
+            let offerer = LegInner::new("secure-caller", &secure_cfg, None).unwrap();
+            let answerer = LegInner::new("secure-callee", &secure_cfg, None).unwrap();
+            sdp_logs.lock().clear();
+            let offer = offerer.create_offer().await.unwrap();
+            let secrets: Vec<_> = offer
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("a=ice-pwd:").or_else(|| {
+                        line.strip_prefix("a=crypto:")?
+                            .split_once("inline:")
+                            .map(|(_, value)| value.split_whitespace().next().unwrap())
+                    })
+                })
+                .collect();
+            assert!(
+                !secrets.is_empty(),
+                "secure SDP must contain its generated credentials"
+            );
+            answerer.answer(&offer).await.unwrap();
+            let rows = sdp_logs.lock();
+            for message in ["leg SDP offer created", "leg SDP applied"] {
+                let row = rows.iter().find(|row| row["message"] == message).unwrap();
+                assert!(
+                    row.values()
+                        .all(|value| secrets.iter().all(|secret| !value.contains(secret))),
+                    "SDP diagnostic events must omit ICE passwords and SRTP key material"
+                );
+                assert_eq!(row["session_id"], "secure-session");
+                assert!(row["leg"].starts_with("secure-"));
+                assert!(row["sdp_bytes"].parse::<usize>().unwrap() > 0);
+            }
+            drop(rows);
+            offerer.stop();
+            answerer.stop();
+        }
     }
 
     #[test]
     fn rtp_leg_uses_configured_network_constraints() {
         let mut cfg = LegConfig::rtp_pcmu();
-        cfg.external_ip = Some("203.0.113.10".to_string());
+        cfg.external_ips = vec!["203.0.113.10".parse().unwrap()];
         cfg.rtp_port_range = Some((20000, 20100));
 
         let rtc = build_rtc_config(&cfg);
 
-        assert_eq!(rtc.external_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!(
+            rtc.external_ips,
+            vec!["203.0.113.10".parse::<std::net::IpAddr>().unwrap()]
+        );
         assert_eq!(rtc.rtp_start_port, Some(20000));
         assert_eq!(rtc.rtp_end_port, Some(20100));
     }
@@ -1854,7 +2688,10 @@ mod tests {
         // DTLS fingerprint, ICE creds and a UDP/TLS/RTP/SAVPF m-line — this is
         // the proxy-side capability P6 real WebRTC e2e relies on.
         let cfg = LegConfig {
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
@@ -1868,14 +2705,17 @@ mod tests {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("webrtc-test".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
+            inband_dtmf: Default::default(),
             relay_ready_timeout: None,
+            ingress_stall_warn_secs: 0,
         };
         let a = LegInner::new("a", &cfg, None).expect("webrtc leg");
         let offer = a.create_offer().await.expect("create_offer");
@@ -1938,7 +2778,10 @@ mod tests {
         // codec. The `a=ssrc` lets the remote browser demux relayed video
         // immediately instead of waiting out the 2–3 s unsignaled-SSRC timeout.
         let cfg = LegConfig {
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
@@ -1952,14 +2795,17 @@ mod tests {
             }],
             video_codecs: negotiate::tests::test_video_codecs(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("video-test".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
+            inband_dtmf: Default::default(),
             relay_ready_timeout: None,
+            ingress_stall_warn_secs: 0,
         };
         let leg = LegInner::new("video", &cfg, None).expect("video leg");
         let offer = leg.create_offer().await.expect("create_offer");
@@ -1999,7 +2845,10 @@ mod tests {
         // m-line was recvonly with no SSRC and the caller suffered the demux
         // delay.
         let cfg = LegConfig {
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
@@ -2013,28 +2862,33 @@ mod tests {
             }],
             video_codecs: negotiate::tests::test_video_codecs(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("video-answer".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
+            inband_dtmf: Default::default(),
             relay_ready_timeout: None,
+            ingress_stall_warn_secs: 0,
         };
         let leg = LegInner::new("answerer", &cfg, None).expect("answerer leg");
 
         // Minimal WebRTC offer with audio + video m-lines (what a browser
-        // sends: sendrecv, video with an SSRC).
+        // sends: BUNDLE, rtcp-mux, sendrecv, video with an SSRC).
         let offer = "v=0\r\n\
             o=- 1 2 IN IP4 127.0.0.1\r\n\
             s=-\r\n\
             c=IN IP4 127.0.0.1\r\n\
             t=0 0\r\n\
+            a=group:BUNDLE 0 1\r\n\
             m=audio 4000 UDP/TLS/RTP/SAVPF 111\r\n\
             a=rtpmap:111 opus/48000/2\r\n\
             a=mid:0\r\n\
             a=sendrecv\r\n\
+            a=rtcp-mux\r\n\
             a=setup:actpass\r\n\
             a=ice-ufrag:uv50\r\n\
             a=ice-pwd:ib8b\r\n\
@@ -2044,13 +2898,14 @@ mod tests {
             a=rtpmap:98 VP8/90000\r\n\
             a=mid:1\r\n\
             a=sendrecv\r\n\
+            a=rtcp-mux\r\n\
             a=setup:actpass\r\n\
             a=ice-ufrag:uv50\r\n\
             a=ice-pwd:ib8b\r\n\
             a=fingerprint:sha-256 F3:04:99:7A:51:6A:C4:D7:30:46:B5:69:82:2A:38:D3:37:D9:66:5B:B6:2F:AD:D3:77:DA:F5:09:2C:9E:DF:8B\r\n";
 
         let answer = leg
-            .apply_sdp(&offer, rustrtc::SdpType::Offer)
+            .answer(&offer)
             .await
             .expect("leg answers video offer");
         assert!(
@@ -2089,6 +2944,24 @@ mod tests {
         leg.stop();
     }
 
+    #[tokio::test]
+    async fn reinvite_draft_leaves_local_answer_uncommitted_until_direction_is_aligned() {
+        let leg = LegInner::new("unbridged", &LegConfig::rtp_pcmu(), None).unwrap();
+        let offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
+        leg.answer(offer).await.unwrap();
+
+        let hold = offer.replace("a=sendrecv", "a=sendonly");
+        leg.apply_remote_sdp(&hold, SdpType::Offer).await.unwrap();
+        let draft = leg.prepare_answer().await.unwrap();
+        assert!(leg.pc().local_description().is_none_or(|desc| desc.sdp_type != SdpType::Pranswer));
+        let aligned = negotiate::MediaNegotiator::align_answer_direction_with_offer(&hold, &draft.to_sdp_string());
+        let answer = leg.commit_local_answer(&aligned, SdpType::Answer).await.unwrap();
+        assert!(answer.lines().any(|line| line == "a=recvonly"));
+        assert_eq!(leg.pc().local_description().unwrap().to_sdp_string(), answer);
+        assert_eq!(leg.pc().signaling_state(), rustrtc::SignalingState::Stable);
+        leg.stop();
+    }
+
     /// Regression: when the caller leg answers an offer whose telephone-event
     /// PTs are not in the local answer (rustrtc's answer formats come from
     /// media_capabilities.audio which excludes telephone-event), the ingress
@@ -2102,7 +2975,10 @@ mod tests {
         use std::net::SocketAddr;
 
         let cfg = LegConfig {
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
@@ -2125,14 +3001,17 @@ mod tests {
             ],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("dtmf-remote-pt".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
+            inband_dtmf: Default::default(),
             relay_ready_timeout: None,
+            ingress_stall_warn_secs: 0,
         };
 
         let leg = LegInner::new("caller-dtmf", &cfg, None).expect("leg");
@@ -2149,7 +3028,7 @@ mod tests {
             a=fmtp:101 0-16\r\n";
 
         let _answer = leg
-            .apply_sdp(offer, SdpType::Offer)
+            .answer(offer)
             .await
             .expect("leg answers baresip/sipbot offer");
 
@@ -2162,7 +3041,7 @@ mod tests {
         tap.on_ingress(&pkt, addr);
         let ev = rx
             .try_recv()
-            .expect("DTMF on offered PT 101 must be detected after apply_sdp");
+            .expect("DTMF on offered PT 101 must be detected after answer");
         assert_eq!(ev.digit, '5');
 
         leg.stop();
@@ -2177,7 +3056,10 @@ mod p24_uac_test {
     async fn uac_leg_apply_answer_after_own_offer() {
         // A leg generates its own offer (UAC), then applies a remote answer with
         // a codec it offered. This mirrors RWI originate's callee leg.
-        let cfg = LegConfig::rtp_pcmu();
+        let mut cfg = LegConfig::rtp_pcmu();
+        cfg.codecs.insert(0, CodecInfo {
+            codec: CodecType::PCMA, payload_type: 8, clock_rate: 8000, channels: 1, fmtp: None,
+        });
         let leg = LegInner::new("uac", &cfg, None).unwrap();
         let offer = leg.create_offer().await.expect("offer");
         assert!(!offer.is_empty());
@@ -2186,11 +3068,17 @@ mod p24_uac_test {
         let answer = format!(
             "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n"
         );
-        let local = leg
-            .apply_sdp(&answer, SdpType::Answer)
+        leg
+            .apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
             .await
             .expect("apply answer");
-        assert!(local.is_empty());
+        let resume = leg.negotiated_local_sdp().unwrap();
+        let offered = SessionDescription::parse(SdpType::Offer, &offer).unwrap();
+        let audio = &resume.media_sections[0];
+        assert_eq!(audio.port, offered.media_sections[0].port, "keep this leg's local port");
+        assert!(offered.media_sections[0].formats.contains(&"8".to_owned()));
+        assert_eq!(audio.formats.first().map(String::as_str), Some("0"));
+        assert!(!audio.formats.contains(&"8".to_owned()), "do not re-offer rejected PCMA");
         let p = leg.negotiated().expect("negotiated profile");
         assert!(
             p.audio.is_some(),
@@ -2210,12 +3098,16 @@ mod p24_uac_test {
 
     /// Field-report repro fingerprint: recording-anchored MediaBridge builds
     /// plain-RTP legs via `LegInner` (not `RtpTrackBuilder`). The offer must be
-    /// acceptable to strict SIP softphones — no BUNDLE/rtcp-mux, distinct
-    /// ports, and no `m=application` datachannel.
+    /// acceptable to strict SIP softphones without BUNDLE and rtcp-mux: a
+    /// distinct port per m-line (RFC 8843 §7.2), an RTCP port with the
+    /// rtcp-mux offer (RFC 5761 §5.1.1), and no `m=application` datachannel.
     #[tokio::test]
-    async fn plain_rtp_av_offer_must_be_legacy_sip_compatible() {
+    async fn plain_rtp_av_offer_works_without_bundle_and_rtcp_mux() {
         let cfg = LegConfig {
+            volume_stats: Default::default(),
+            quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
@@ -2236,25 +3128,29 @@ mod p24_uac_test {
                 rtx_payload_type: None,
             }],
             rtp_port_range: Some((20000, 20100)),
-            external_ip: Some("127.0.0.1".to_string()),
-            bind_ip: Some("127.0.0.1".to_string()),
+            external_ips: vec!["127.0.0.1".parse().unwrap()],
+            bind_ips: vec!["127.0.0.1".parse().unwrap()],
+            prefer_ipv6: false,
             cname: Some("repro".to_string()),
             comfort_noise: false,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
+            inband_dtmf: Default::default(),
             relay_ready_timeout: None,
+            ingress_stall_warn_secs: 0,
         };
         let leg = LegInner::new("plain-rtp-av", &cfg, None).expect("leg");
         let offer = leg.create_offer().await.expect("offer");
         println!("plain RTP A/V offer:\n{offer}");
         assert!(
-            !offer.contains("a=group:BUNDLE"),
-            "BUNDLE causes 488 on strict SIP phones:\n{offer}"
+            !offer.contains("a=bundle-only"),
+            "a peer without BUNDLE rejects bundle-only m-lines:\n{offer}"
         );
-        assert!(
-            !offer.contains("a=rtcp-mux"),
-            "rtcp-mux causes 488 on strict SIP phones:\n{offer}"
+        assert_eq!(
+            offer.matches("a=rtcp-mux").count(),
+            offer.matches("a=rtcp:").count(),
+            "a peer without rtcp-mux needs an RTCP port on each m-line:\n{offer}"
         );
         assert!(
             !offer.contains("m=application"),
@@ -2279,10 +3175,12 @@ mod p24_uac_test {
 #[cfg(test)]
 mod ice_lite_tests {
     use super::*;
+    use rustrtc::Connectivity;
 
     fn rtp_cfg(enable_ice_lite: bool) -> LegConfig {
         LegConfig {
             call_id: None,
+            root_session_id: None,
             enable_ice_lite,
             ..LegConfig::rtp_pcmu()
         }
@@ -2305,7 +3203,7 @@ mod ice_lite_tests {
             a=rtpmap:101 telephone-event/8000\r\n\
             a=sendrecv\r\n";
         let answer = leg
-            .apply_sdp(remote_offer, SdpType::Offer)
+            .answer(remote_offer)
             .await
             .expect("apply offer");
         assert!(
@@ -2324,6 +3222,41 @@ mod ice_lite_tests {
             answer.contains("a=candidate"),
             "ice-lite answer must carry candidates for the remote checks:\n{answer}"
         );
+        leg.stop();
+    }
+
+    /// SDES-SRTP legs (Linphone over TLS) answer as ICE-lite too, so a
+    /// full-ICE phone can prove a path when its c= is unreachable (an IPv6
+    /// address to an IPv4-only server).
+    #[tokio::test]
+    async fn srtp_leg_answers_with_ice_lite_attributes() {
+        let cfg = LegConfig {
+            call_id: None,
+            transport: TransportMode::Srtp,
+            enable_ice_lite: true,
+            ..LegConfig::rtp_pcmu()
+        };
+        let leg = LegInner::new("ice-lite-srtp", &cfg, None).expect("leg");
+        let remote_offer = "v=0\r\n\
+            o=- 1 2 IN IP6 2001:db8::1\r\n\
+            s=-\r\n\
+            c=IN IP6 2001:db8::1\r\n\
+            t=0 0\r\n\
+            m=audio 4000 RTP/SAVP 0 101\r\n\
+            a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:a976SJLwniPcMiUP27gdcLYYcPm0bHZcghV84DsK\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n\
+            a=ice-ufrag:phon\r\n\
+            a=ice-pwd:phonepasswordphonepassword\r\n\
+            a=candidate:1 1 UDP 2130706431 127.0.0.1 4002 typ host\r\n\
+            a=sendrecv\r\n";
+        let answer = leg
+            .answer(remote_offer)
+            .await
+            .expect("apply offer");
+        for attr in ["a=ice-lite", "a=ice-ufrag", "a=ice-pwd", "a=candidate", "a=crypto"] {
+            assert!(answer.contains(attr), "answer must have {attr}:\n{answer}");
+        }
         leg.stop();
     }
 
@@ -2358,7 +3291,7 @@ mod ice_lite_tests {
             a=rtpmap:0 PCMU/8000\r\n\
             a=sendrecv\r\n";
         let answer = leg
-            .apply_sdp(remote_offer, SdpType::Offer)
+            .answer(remote_offer)
             .await
             .expect("apply offer");
         assert!(
@@ -2376,26 +3309,34 @@ mod ice_lite_tests {
     async fn build_rtc_config_forces_ice_lite_off_for_webrtc() {
         let cfg = LegConfig {
             call_id: None,
+            root_session_id: None,
             transport: TransportMode::WebRtc,
             enable_ice_lite: true,
             ..LegConfig::rtp_pcmu()
         };
         let rtc = build_rtc_config(&cfg);
-        assert!(
-            !rtc.enable_ice_lite,
+        assert_eq!(
+            rtc.connectivity,
+            Connectivity::Ice,
             "WebRTC legs must keep full ICE regardless of the flag"
         );
         let rtc_rtp = build_rtc_config(&rtp_cfg(true));
-        assert!(rtc_rtp.enable_ice_lite, "RTP legs honor the flag");
+        assert_eq!(
+            rtc_rtp.connectivity,
+            Connectivity::IceLite,
+            "RTP legs honor the flag"
+        );
         let rtc_srtp = build_rtc_config(&LegConfig {
             call_id: None,
+            root_session_id: None,
             transport: TransportMode::Srtp,
             enable_ice_lite: true,
             ..LegConfig::rtp_pcmu()
         });
-        assert!(
-            !rtc_srtp.enable_ice_lite,
-            "SDES/Srtp legs are outside the ICE-lite path (rustrtc Rtp-only)"
+        assert_eq!(
+            rtc_srtp.connectivity,
+            Connectivity::IceLite,
+            "SDES/Srtp legs honor the flag"
         );
     }
 
@@ -2408,6 +3349,6 @@ mod ice_lite_tests {
             .with_ice_lite(true)
             .build();
         let pc = track.get_peer_connection().await.expect("pc");
-        assert!(!pc.config().enable_ice_lite);
+        assert_eq!(pc.config().connectivity, Connectivity::Ice);
     }
 }

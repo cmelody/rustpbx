@@ -65,29 +65,15 @@ impl AddonRegistry {
         #[cfg(feature = "addon-archive")]
         addons.push(Arc::new(super::archive::ArchiveAddon::new()));
 
-        // Wholesale Addon
-        #[cfg(feature = "addon-wholesale")]
-        addons.push(Arc::new(super::wholesale::WholesaleAddon::new()));
-
         // Transcript Addon
         #[cfg(feature = "addon-transcript")]
         addons.push(Arc::new(super::transcript::TranscriptAddon::new()));
 
-        // Voicemail Addon (Commercial)
-        #[cfg(feature = "addon-voicemail")]
-        addons.push(Arc::new(super::voicemail::VoicemailAddon::new()));
-
-        // IVR Editor Addon (Commercial)
-        #[cfg(feature = "addon-ivr-editor")]
-        addons.push(Arc::new(super::ivr_editor::IvrEditorAddon::new()));
-
         // Queue Addon
         addons.push(Arc::new(super::queue::QueueAddon::new()));
 
-        // CC Addon (Contact Center)
-        #[cfg(feature = "addon-cc")]
-        addons.push(Arc::new(super::cc::CcAddon::new()));
-
+        // External addons (including voicemail, IVR, CC and wholesale) are
+        // supplied by the edition's entry point.
         addons.extend(extra);
 
         // Collect export/reload handlers from addons (not gated by feature)
@@ -148,19 +134,6 @@ impl AddonRegistry {
         Ok(())
     }
 
-    pub async fn seed_all_fixtures(&self, state: AppState) -> anyhow::Result<()> {
-        let config = state.config();
-        for addon in &self.addons {
-            if !self.is_enabled(addon.id(), config) {
-                continue;
-            }
-            if let Err(e) = addon.seed_fixtures(state.clone()).await {
-                tracing::error!("Failed to seed fixtures for addon {}: {}", addon.name(), e);
-            }
-        }
-        Ok(())
-    }
-
     pub fn get_routers(&self, state: AppState) -> axum::Router {
         let config = state.config();
         let mut router = axum::Router::new();
@@ -173,6 +146,20 @@ impl AddonRegistry {
             }
         }
         router
+    }
+
+    /// The first enabled addon that overrides the ICE servers endpoint, if any.
+    pub fn get_ice_servers_route(&self, state: AppState) -> Option<axum::Router> {
+        let config = state.config();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) {
+                continue;
+            }
+            if let Some(r) = addon.ice_servers_route(state.clone()) {
+                return Some(r);
+            }
+        }
+        None
     }
 
     /// Collect AMI-relative routes from enabled addons (merged under AMI auth).
@@ -188,21 +175,6 @@ impl AddonRegistry {
             }
         }
         router
-    }
-}
-
-/// Merge every compiled-in addon's error catalog into `reg`.
-///
-/// Prefer [`AddonRegistry::merge_error_catalogs_into`] when a live registry is
-/// available (app startup). This free function remains for tests that cannot
-/// construct a full registry.
-#[cfg(any(feature = "addon-wholesale", test))]
-pub fn merge_compiled_addon_error_catalogs(reg: &mut crate::call_errors::CallErrRegistry) {
-    let _ = &reg;
-    #[cfg(feature = "addon-wholesale")]
-    {
-        use super::Addon;
-        reg.merge_slice(super::wholesale::WholesaleAddon::new().error_catalog());
     }
 }
 
@@ -252,7 +224,7 @@ impl AddonRegistry {
     ) -> Vec<String> {
         self.addons
             .iter()
-            .filter(|a| self.is_enabled(a.id(), config))
+            .filter(|a| self.is_enabled(a.id(), config) && a.has_console_pages())
             .filter(|a| {
                 !addon_template_dirs(a.as_ref())
                     .iter()
@@ -335,7 +307,12 @@ impl AddonRegistry {
             .any(|a| a.category() == crate::addons::AddonCategory::Commercial)
     }
 
+    /// Whether addon `id` is registered with this registry (supplied by the
+    /// edition's entry point), listed in `[proxy] addons`, and licensed.
     pub fn is_enabled(&self, id: &str, config: &crate::config::Config) -> bool {
+        if self.get_addon(id).is_none() {
+            return false;
+        }
         let listed = config
             .proxy
             .addons
@@ -409,6 +386,29 @@ impl AddonRegistry {
         routers
     }
 
+    /// Collect public (unauthenticated) console API routes from enabled addons
+    /// (same enablement rule as [`Self::get_console_api_routes`]).
+    ///
+    /// The caller mounts them under the api prefix WITHOUT the
+    /// api_auth_middleware / csrf_guard layers.
+    #[cfg(feature = "console")]
+    pub fn get_console_public_api_routes(
+        &self,
+        state: &crate::console::ConsoleState,
+        config: &crate::config::Config,
+    ) -> Vec<axum::Router<Arc<crate::console::ConsoleState>>> {
+        let mut routers = Vec::new();
+        for addon in &self.addons {
+            if !self.is_enabled(addon.id(), config) && !addon.console_api_always_mounted() {
+                continue;
+            }
+            if let Some(r) = addon.console_public_api_routes(state) {
+                routers.push(r);
+            }
+        }
+        routers
+    }
+
     /// Ask every compiled-in addon to promote cookie extensions onto `dialplan`.
     /// Independent of `[proxy].addons` enablement — matches prior
     /// `cfg(feature = "addon-…")` behavior for CDR early-reject paths.
@@ -430,6 +430,27 @@ impl AddonRegistry {
                 reg.merge_slice(cat);
             }
         }
+    }
+
+    /// Apply a shared-queue priority bump through the addon that owns the
+    /// shared-queue table (first addon reporting an update wins). Callers
+    /// gate on the gateway's injected shared-queue DB, so reaching here with
+    /// no addon answering simply means the row was not updated.
+    pub async fn shared_queue_update_priority(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        call_id: &str,
+        priority: i32,
+    ) -> bool {
+        for addon in &self.addons {
+            if addon
+                .shared_queue_update_priority(db, call_id, priority)
+                .await
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Collect update-check phone-home params from all addons.
@@ -1004,6 +1025,21 @@ mod asset_path_tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[test]
+    fn enabled_requires_registered_and_listed() {
+        let _guard = license_store_lock();
+        crate::license::record_startup_results(std::collections::HashMap::new());
+        let registry = AddonRegistry::with_extra_addons(vec![Arc::new(PathAddon)]);
+        assert!(registry.is_enabled("pathaddon", &enabled_config()));
+        // Listed but not registered (e.g. a config shared with another edition).
+        let mut config = enabled_config();
+        config.proxy.addons = Some(vec!["voicemail".into()]);
+        assert!(registry.get_addon("voicemail").is_none());
+        assert!(!registry.is_enabled("voicemail", &config));
+        // Registered but not listed.
+        assert!(!registry.is_enabled("pathaddon", &Config::default()));
     }
 
     #[test]

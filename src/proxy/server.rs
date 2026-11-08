@@ -82,6 +82,7 @@ pub struct SipServerInner {
     pub database: Option<DatabaseConnection>,
     pub user_backend: Box<dyn UserBackend>,
     pub auth_backend: Vec<Box<dyn AuthBackend>>,
+    pub registration_response_hook: Option<Arc<dyn super::registrar::RegistrationResponseHook>>,
     pub call_router: Option<Box<dyn CallRouter>>,
     pub dialplan_inspectors: Arc<
         parking_lot::RwLock<
@@ -91,6 +92,14 @@ pub struct SipServerInner {
     pub locator: Arc<Box<dyn Locator>>,
     pub callrecord_sender: Option<CallRecordSender>,
     pub endpoint: Endpoint,
+    /// Startup-only snapshot of this node's listener addresses (host
+    /// pre-formatted, port as `u16`), captured after every transport is bound
+    /// but before any remote connection can exist. `Endpoint::get_addrs()`
+    /// also mixes in every tracked remote connection — including the
+    /// ever-growing WS/UDP peer cache — so hot-path checks such as
+    /// `is_same_realm` must compare against this snapshot instead; otherwise
+    /// each call clones and stringifies thousands of remote addresses.
+    pub local_listen_addrs: Vec<(String, Option<u16>)>,
     pub dialog_layer: Arc<DialogLayer>,
     pub create_route_invites: Vec<FnCreateRouteInvite>,
     pub ignore_out_of_dialog_request: bool,
@@ -111,6 +120,11 @@ pub struct SipServerInner {
     /// IVR step trace collector (set by IVR Editor addon, accessed by StepIvrApp).
     pub ivr_trace: Option<Arc<crate::call::app::ivr::trace::IvrTraceCollector>>,
     pub tls_listener: Option<rsipstack::transport::TlsListenerConnection>,
+    /// Every transport connection bound at startup (UDP sockets, TCP/TLS/WS
+    /// listeners). The rolling handover closes them (cancel token + remove
+    /// from the transport layer) without touching the media runtime.
+    /// Empty outside rolling builds.
+    pub bound_transports: std::sync::Mutex<Vec<SipConnection>>,
     pub conference_manager: Arc<crate::call::runtime::ConferenceManager>,
     pub conference_server: Arc<crate::call::runtime::ConferenceServer>,
     pub agent_registry: Option<Arc<dyn crate::call::app::agent_registry::AgentRegistry>>,
@@ -143,7 +157,10 @@ pub struct SipServerInner {
     /// cluster is not configured.
     pub session_registry: crate::call::runtime::SessionRegistryRef,
     /// Keeps the owning node's sessions alive (single batch update per tick).
-    pub session_registry_heartbeat: Option<crate::call::runtime::NodeHeartbeat>,
+    /// Mutex-wrapped so the rolling handover can stop the heartbeat without
+    /// owning the server struct (`RollingRuntime::begin_handover`).
+    pub session_registry_heartbeat:
+        std::sync::Mutex<Option<crate::call::runtime::NodeHeartbeat>>,
     /// Trunk health check states (populated by trunk_health background loop).
     pub trunk_health: Option<crate::proxy::trunk_health::HealthStateMap>,
     /// Session lifecycle hooks (connected, held, unheld, ended).
@@ -182,6 +199,7 @@ pub struct SipServerBuilder {
     http_client: Option<reqwest::Client>,
     user_backend: Option<Box<dyn UserBackend>>,
     auth_backend: Vec<Box<dyn AuthBackend>>,
+    registration_response_hook: Option<Arc<dyn super::registrar::RegistrationResponseHook>>,
     call_router: Option<Box<dyn CallRouter>>,
     module_fns: HashMap<String, FnCreateProxyModule>,
     locator: Option<Box<dyn Locator>>,
@@ -228,6 +246,11 @@ pub struct SipServerBuilder {
     trunk_health: Option<crate::proxy::trunk_health::HealthStateMap>,
     /// Session lifecycle hooks registered via [`SipServerBuilder::with_session_hook`].
     session_hooks: Vec<Arc<dyn crate::proxy::proxy_call::session_hooks::CallSessionHook>>,
+    /// Rolling handover runtime (None unless `[rolling] enabled`). When
+    /// present, UDP transports are created through the rolling pump
+    /// (per-datagram forward hook) and listeners are retained in
+    /// `SipServerInner::bound_transports` for the handover-time close.
+    rolling: Option<Arc<crate::rolling::RollingRuntime>>,
 }
 
 impl SipServerBuilder {
@@ -242,6 +265,7 @@ impl SipServerBuilder {
             http_client: None,
             user_backend: None,
             auth_backend: Vec::new(),
+            registration_response_hook: None,
             call_router: None,
             module_fns: HashMap::new(),
             locator: None,
@@ -273,11 +297,15 @@ impl SipServerBuilder {
             cluster_config: None,
             trunk_health: None,
             session_hooks: Vec::new(),
+            rolling: None,
         }
     }
 
-    pub fn with_trunk_health(mut self, health: crate::proxy::trunk_health::HealthStateMap) -> Self {
-        self.trunk_health = Some(health);
+    pub fn with_rolling(
+        mut self,
+        rolling: Option<Arc<crate::rolling::RollingRuntime>>,
+    ) -> Self {
+        self.rolling = rolling;
         self
     }
 
@@ -334,18 +362,16 @@ impl SipServerBuilder {
         self
     }
 
-    pub fn with_ignore_out_of_dialog_request(mut self, ignore: bool) -> Self {
-        self.ignore_out_of_dialog_request = ignore;
-        self
-    }
-
     pub fn with_auth_backend(mut self, auth_backend: Box<dyn AuthBackend>) -> Self {
         self.auth_backend.push(auth_backend);
         self
     }
 
-    pub fn with_call_router(mut self, call_router: Box<dyn CallRouter>) -> Self {
-        self.call_router = Some(call_router);
+    pub fn with_registration_response_hook(
+        mut self,
+        hook: Arc<dyn super::registrar::RegistrationResponseHook>,
+    ) -> Self {
+        self.registration_response_hook = Some(hook);
         self
     }
 
@@ -434,21 +460,6 @@ impl SipServerBuilder {
 
     pub fn with_database_connection(mut self, db: DatabaseConnection) -> Self {
         self.database = Some(db);
-        self
-    }
-
-    pub fn with_data_context(mut self, context: Arc<ProxyDataContext>) -> Self {
-        self.data_context = Some(context);
-        self
-    }
-
-    pub fn with_locator_events(mut self, locator_events: Option<LocatorEventSender>) -> Self {
-        self.locator_events = locator_events;
-        self
-    }
-
-    pub fn with_frequency_limiter(mut self, limiter: Arc<dyn FrequencyLimiter>) -> Self {
-        self.frequency_limiter = Some(limiter);
         self
     }
 
@@ -628,7 +639,6 @@ impl SipServerBuilder {
                 }
             }
         };
-
         let locator = Arc::new(locator);
         let mut rtp_config = self.rtp_config.unwrap_or_default();
         let mut sip_contact_config = self.sip_contact_config.unwrap_or_default();
@@ -660,6 +670,19 @@ impl SipServerBuilder {
         #[cfg(unix)]
         log_rlimit_nofile().await;
         let transport_layer = TransportLayer::new(cancel_token.clone());
+        match config.stream_idle_timeout {
+            Some(secs) => {
+                transport_layer.set_stream_idle_timeout(std::time::Duration::from_secs(secs));
+                info!(
+                    secs,
+                    "configured stream (TCP/TLS/WS) idle timeout (0 = disabled)"
+                );
+            }
+            None => info!(
+                default_secs = rsipstack::transport::transport_layer::DEFAULT_STREAM_IDLE_TIMEOUT_MS / 1000,
+                "stream idle timeout not configured, using default"
+            ),
+        }
         if let Some(ca_path) = config.tls_ca_certificates.as_deref()
             && !ca_path.trim().is_empty()
         {
@@ -682,6 +705,8 @@ impl SipServerBuilder {
         }
         // Clone of TLS listener for hot-reload support (initialized inside if !self.no_bind block)
         let mut tls_listener_clone: Option<rsipstack::transport::TlsListenerConnection> = None;
+        // Rolling builds retain every transport for the handover-time close.
+        let mut bound_transports: Vec<SipConnection> = Vec::new();
 
         let mut local_addrs: HashSet<SocketAddr> = HashSet::new();
 
@@ -773,17 +798,34 @@ impl SipServerBuilder {
                 let external_addr = external_ip
                     .as_ref()
                     .map(|ip| SocketAddr::new(*ip, udp_port));
-                let udp_conn = UdpConnection::create_connection(
-                    local_addr,
-                    external_addr,
-                    Some(cancel_token.child_token()),
-                )
-                .await
-                .map_err(|e| {
-                    anyhow!("Failed to create proxy UDP connection {} {}", local_addr, e)
-                })?;
-                info!("start proxy, udp port: {}", udp_conn.get_addr());
-                transport_layer.add_transport(udp_conn.into());
+                let udp_conn = if let Some(rolling) = &self.rolling {
+                    // Rolling successor: socket owned by the rolling pump so
+                    // inbound datagrams get a pre-transaction forward hook.
+                    crate::rolling::create_udp_transport(local_addr, rolling).await?
+                } else {
+                    let udp_conn = UdpConnection::create_connection(
+                        local_addr,
+                        external_addr,
+                        Some(cancel_token.child_token()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow!("Failed to create proxy UDP connection {} {}", local_addr, e)
+                    })?;
+                    let conn: SipConnection = udp_conn.into();
+                    info!("start proxy, udp port: {}", udp_port);
+                    conn
+                };
+                // The rolling UDP transport is a ChannelConnection: it must be
+                // served via add_connection (spawns the serve_loop that feeds
+                // injected events into the endpoint) AND present in listens
+                // (the transport lookup's UDP fallback for outbound sends).
+                if let Some(rolling) = &self.rolling {
+                    transport_layer.add_connection(udp_conn.clone());
+                    bound_transports.push(udp_conn.clone());
+                    let _ = rolling;
+                }
+                transport_layer.add_transport(udp_conn.clone());
                 local_addrs.insert(local_addr);
             }
 
@@ -796,7 +838,11 @@ impl SipServerBuilder {
                     .await
                     .map_err(|e| anyhow!("Failed to create TCP connection: {}", e))?;
                 info!("start proxy, tcp port: {}", tcp_conn.get_addr());
-                transport_layer.add_transport(tcp_conn.into());
+                let conn: SipConnection = tcp_conn.into();
+                if self.rolling.is_some() {
+                    bound_transports.push(conn.clone());
+                }
+                transport_layer.add_transport(conn);
                 local_addrs.insert(local_addr);
             }
 
@@ -864,7 +910,11 @@ impl SipServerBuilder {
                                     );
                                     // Clone for hot-reload support
                                     tls_listener_clone = Some(conn.clone());
-                                    transport_layer.add_transport(conn.into());
+                                    let sip_conn: SipConnection = conn.into();
+                                    if self.rolling.is_some() {
+                                        bound_transports.push(sip_conn.clone());
+                                    }
+                                    transport_layer.add_transport(sip_conn);
                                     local_addrs.insert(local_addr);
                                 }
                                 Err(e) => {
@@ -901,8 +951,34 @@ impl SipServerBuilder {
 
         let mut endpoint_option = EndpointOption {
             callid_suffix: config.callid_suffix.clone(),
+            // RFC 7044: advertise `Supported: histinfo` when History-Info
+            // rendering is enabled so peers include their hi-entries.
+            history_info_enabled: config.history_info,
             ..Default::default()
         };
+
+        // Seed the global session-id generator from config. Invalid lengths
+        // are clamped into the legal band (defaults keep the legacy 32-hex
+        // behaviour when the keys are absent).
+        let session_id_length = crate::call::session_id::init_settings(
+            config.session_id_length,
+            config.session_id_header_mode,
+            config.session_id_inherit_callid,
+        );
+        if session_id_length != config.session_id_length {
+            warn!(
+                configured = config.session_id_length,
+                effective = session_id_length,
+                "proxy.session_id_length out of range, clamped"
+            );
+        } else if session_id_length != crate::call::session_id::LENGTH_MAX {
+            info!(
+                length = session_id_length,
+                mode = ?config.session_id_header_mode,
+                inherit_callid = config.session_id_inherit_callid,
+                "session id generator configured"
+            );
+        }
 
         if let Some(t1_timer) = config.t1_timer {
             endpoint_option.t1 = Duration::from_millis(t1_timer);
@@ -918,11 +994,25 @@ impl SipServerBuilder {
             .with_option(endpoint_option)
             .with_transport_layer(transport_layer);
 
+        let database = self.database.clone();
+
+        let data_context = if let Some(ref context) = self.data_context {
+            context.clone()
+        } else {
+            let dc = Arc::new(
+                ProxyDataContext::new(self.config.clone(), database.clone())
+                    .await
+                    .map_err(|err| anyhow!("failed to initialize proxy data context: {err}"))?,
+            );
+            self.data_context = Some(dc.clone());
+            dc
+        };
+
         let advertised_methods = Arc::new(OnceLock::new());
         let mut inspectors: Vec<Box<dyn MessageInspector>> = self.message_inspectors;
-        if self.config.nat_fix {
-            inspectors.insert(0, Box::new(super::nat::NatInspector::new()));
-        }
+        // Always installed: trunks may enable `nat_fix` even when the global
+        // switch is off. The data context keeps its trunk list current.
+        inspectors.insert(0, Box::new(data_context.nat_inspector().clone()));
         inspectors.push(Box::new(
             super::capability_headers::CapabilityHeadersInspector::new(advertised_methods.clone()),
         ));
@@ -968,7 +1058,7 @@ impl SipServerBuilder {
         locator.set_event_sender(Some(locator_events.clone()));
         locator.set_event_lock(Some(locator_event_lock.clone()));
 
-        let locator_local_addrs = endpoint_local_addrs;
+        let locator_local_addrs = endpoint_local_addrs.clone();
         let cluster_enabled = !self.cluster_peers.is_empty();
 
         endpoint_builder = endpoint_builder
@@ -1026,23 +1116,11 @@ impl SipServerBuilder {
                 ArcSwap::new(Arc::new(self.config.media_proxy)),
                 self.config.enable_latching,
                 self.config.latching_probation_max_packets,
+                data_context.clone(),
             )));
         }
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
 
-        let database = self.database.clone();
-
-        let data_context = if let Some(ref context) = self.data_context {
-            context.clone()
-        } else {
-            let dc = Arc::new(
-                ProxyDataContext::new(self.config.clone(), database.clone())
-                    .await
-                    .map_err(|err| anyhow!("failed to initialize proxy data context: {err}"))?,
-            );
-            self.data_context = Some(dc.clone());
-            dc
-        };
         // Wire up the SIP endpoint for trunk registration BEFORE reconciling,
         // so trunks with register_enabled=true are registered on startup.
         data_context
@@ -1054,7 +1132,10 @@ impl SipServerBuilder {
         }
 
         let active_call_registry = Arc::new(ActiveProxyCallRegistry::new());
-        let presence_manager = Arc::new(PresenceManager::new(database.clone()));
+        let presence_manager = Arc::new(
+            PresenceManager::new(database.clone())
+                .with_registration_guard(locator.clone(), locator_event_lock.clone()),
+        );
         presence_manager.load_from_db().await.ok();
 
         // Create cluster event hub for local event dispatch.
@@ -1092,13 +1173,14 @@ impl SipServerBuilder {
             let locator_event_lock_for_sweep = locator_event_lock.clone();
             let sweep_token = cancel_token.child_token();
             tokio::spawn(async move {
-                // Run roughly every quarter of the shortest typical registrar
+                // Run at a cadence below the shortest typical registrar
                 // expiry (the server caps Contact expiry at ~50s, see
-                // registrar.rs `max_registrar_expires`). 15s gives us <1 expiry
-                // interval of latency between the binding technically expiring
-                // and the agent being marked offline.
-                const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-                let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+                // registrar.rs `max_registrar_expires`); config-driven
+                // (default 15s) so e2e can shrink expiry-related waits.
+                let sweep_interval = std::time::Duration::from_secs(
+                    config.clamped_locator_sweep_secs() as u64,
+                );
+                let mut ticker = tokio::time::interval(sweep_interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Skip the immediate first tick — there is nothing to sweep
                 // right after boot and we don't want to log a noisy "swept 0"
@@ -1116,8 +1198,12 @@ impl SipServerBuilder {
                                         count = removed.len(),
                                         "locator swept expired registrations"
                                     );
-                                    let _ = locator_events_for_sweep
-                                        .send(LocatorEvent::Offline(removed));
+                                    let _ = locator_events_for_sweep.send(
+                                        LocatorEvent::Offline(
+                                            removed,
+                                            crate::proxy::locator::LocatorOfflineReason::Expired,
+                                        ),
+                                    );
                                 }
                                 Ok(_) => {}
                                 Err(e) => warn!(error = %e, "locator sweep failed"),
@@ -1146,7 +1232,7 @@ impl SipServerBuilder {
         //   no peers                  — no-op (single-node)
         let (session_registry, session_registry_heartbeat): (
             crate::call::runtime::SessionRegistryRef,
-            Option<crate::call::runtime::NodeHeartbeat>,
+            std::sync::Mutex<Option<crate::call::runtime::NodeHeartbeat>>,
         ) = {
             use crate::call::runtime::{
                 DbSessionRegistry, MemorySessionRegistry, NoopSessionRegistry,
@@ -1190,16 +1276,19 @@ impl SipServerBuilder {
                     // protection).  Harmless for a noop registry (no-op).
                     let live_ids_registry = active_call_registry.clone();
                     let live_call_ids: crate::call::runtime::LiveCallIdsFn =
-                        Arc::new(move || live_ids_registry.session_ids());
+                        Arc::new(move || live_ids_registry.live_call_ids());
                     let heartbeat_task = crate::call::runtime::NodeHeartbeat::spawn(
                         registry.clone(),
                         node_id,
                         heartbeat,
                         live_call_ids,
                     );
-                    (registry, Some(heartbeat_task))
+                    (registry, std::sync::Mutex::new(Some(heartbeat_task)))
                 }
-                _ => (Arc::new(NoopSessionRegistry), None),
+                _ => (
+                    Arc::new(NoopSessionRegistry),
+                    std::sync::Mutex::new(None),
+                ),
             }
         };
 
@@ -1225,10 +1314,15 @@ impl SipServerBuilder {
             database: database.clone(),
             user_backend,
             auth_backend,
+            registration_response_hook: self.registration_response_hook,
             call_router,
             locator: locator.clone(),
             callrecord_sender: self.callrecord_sender,
             endpoint,
+            local_listen_addrs: endpoint_local_addrs
+                .iter()
+                .map(|a| (a.addr.host.to_string(), a.addr.port.map(|p| p.value())))
+                .collect(),
             dialog_layer,
             dialplan_inspectors: Arc::new(parking_lot::RwLock::new(self.dialplan_inspectors)),
             create_route_invites: self.create_route_invites,
@@ -1253,6 +1347,7 @@ impl SipServerBuilder {
             rwi_gateway: self.rwi_gateway,
             ivr_trace: self.ivr_trace,
             tls_listener: tls_listener_clone,
+            bound_transports: std::sync::Mutex::new(bound_transports),
             conference_manager,
             conference_server,
             agent_registry: self.agent_registry,
@@ -1497,14 +1592,6 @@ impl SipServer {
         self.inner.clone()
     }
 
-    pub fn get_modules(&self) -> impl Iterator<Item = &Box<dyn ProxyModule>> {
-        self.modules.iter()
-    }
-
-    pub fn get_cancel_token(&self) -> CancellationToken {
-        self.inner.cancel_token.clone()
-    }
-
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {
         while let Some(mut tx) = incoming.recv().await {
             crate::metrics::transaction::received();
@@ -1520,16 +1607,20 @@ impl SipServer {
 
             let runnings_tx = self.inner.runnings_tx.clone();
 
-            let source_ip = tx
+            let remote_addr = tx
                 .connection
                 .as_ref()
-                .and_then(|conn| conn.get_remote_addr())
-                .and_then(crate::proxy::routing::source_addr_ip);
-            let source_transport = tx
-                .connection
-                .as_ref()
-                .and_then(|conn| conn.get_remote_addr())
-                .and_then(|addr| addr.r#type);
+                .and_then(|conn| conn.get_remote_addr());
+            let source_ip = remote_addr.and_then(crate::proxy::routing::source_addr_ip);
+            let source_transport = remote_addr.and_then(|addr| addr.r#type);
+            // Log-friendly "ip:port" / transport strings: Display formatting
+            // keeps the noisy `Some(...)` Debug wrappers out of the logs.
+            let source_addr = remote_addr
+                .map(|addr| addr.addr.to_string())
+                .unwrap_or_default();
+            let source_transport_str = source_transport
+                .map(|transport| transport.to_string())
+                .unwrap_or_default();
 
             if let Some(max_concurrency) = self.inner.proxy_config.load().max_concurrency
                 && runnings_tx.load(Ordering::Relaxed) >= max_concurrency
@@ -1546,11 +1637,18 @@ impl SipServer {
                 continue;
             }
             // Graceful shutdown (drain): while draining, reject ALL
-            // out-of-dialog requests (new REGISTER / INVITE / SUBSCRIBE /
-            // OPTIONS / ...) so no new registrations or calls are accepted.
-            // In-dialog requests (To-tag present, e.g. BYE / re-INVITE / ACK)
-            // keep flowing so active calls can finish cleanly. Health probes
-            // answer 500 to signal the draining state to the load balancer.
+            // out-of-dialog requests (new INVITE / SUBSCRIBE / OPTIONS / ...)
+            // so no new calls are accepted. In-dialog requests (To-tag
+            // present, e.g. BYE / re-INVITE / ACK) keep flowing so active
+            // calls can finish cleanly. Health probes answer 500 to signal
+            // the draining state to the load balancer.
+            //
+            // REGISTER is exempt — but ONLY in master/worker mode: a
+            // registration refresh is not a new call, and refusing it would
+            // let bindings expire while this generation is still draining
+            // (hours on a long call) — the cross-gen relay resolves
+            // dispatches through those bindings. Standalone keeps the
+            // historical reject-everything drain behavior.
             if crate::shutdown::is_draining() {
                 let to_tag = tx
                     .original
@@ -1567,7 +1665,7 @@ impl SipServer {
                     crate::metrics::transaction::rejected("shutting_down");
                     warn!(
                         key = %tx.key,
-                        method = ?tx.original.method,
+                        method = %tx.original.method,
                         "draining: rejecting out-of-dialog request"
                     );
                     tx.reply(code).await.ok();
@@ -1630,7 +1728,7 @@ impl SipServer {
                             false
                         };
                         if from_websocket || is_trunk || from_trusted_proxy {
-                            info!(key = %tx.key, via_ip = %via_ip_str, ?source_ip, ?source_transport, "responding 200 OK to connectivity OPTIONS");
+                            info!(key = %tx.key, via_ip = %via_ip_str, source = %source_addr, transport = %source_transport_str, "responding 200 OK to connectivity OPTIONS");
                             tx.reply(rsipstack::sip::StatusCode::OK).await.ok();
                             continue;
                         }
@@ -1653,22 +1751,27 @@ impl SipServer {
             crate::utils::spawn(async move {
                 runnings_tx.fetch_add(1, Ordering::Relaxed);
                 let start_time = Instant::now();
+                let call_id = tx.original.call_id_header().ok().map(|header| header.value().to_string());
                 let cookie = TransactionCookie::from(&tx.key);
                 let guard = token.clone().drop_guard();
                 select! {
                     r = Self::process_transaction(token.clone(), modules, cookie.clone(),  &mut tx) => {
-                        let final_status = tx.last_response.as_ref().map(|r| r.status_code());
+                        let final_status = tx
+                            .last_response
+                            .as_ref()
+                            .map(|r| r.status_code().code().to_string())
+                            .unwrap_or_default();
                         match r {
                             Ok(_) => {
-                                debug!(key = %tx.key, ?source_ip, ?final_status, "transaction processed in {:?}", start_time.elapsed());
+                                debug!(call_id = call_id.as_deref(), key = %tx.key, source = %source_addr, final_status = %final_status, "transaction processed in {:?}", start_time.elapsed());
                             },
                             Err(e) => {
-                                warn!(key = %tx.key, ?source_ip, ?final_status, "failed to process transaction: {} in {:?}", e, start_time.elapsed());
+                                warn!(call_id = call_id.as_deref(), key = %tx.key, source = %source_addr, final_status = %final_status, "failed to process transaction: {} in {:?}", e, start_time.elapsed());
                             }
                         }
                     }
                     _ = token.cancelled() => {
-                        info!(key = %tx.key, "transaction cancelled");
+                        info!(call_id = call_id.as_deref(), key = %tx.key, "transaction cancelled");
                     }
                 };
                 crate::metrics::transaction::latency_seconds(start_time.elapsed().as_secs_f64());
@@ -1707,6 +1810,7 @@ impl SipServer {
         cookie: TransactionCookie,
         tx: &mut Transaction,
     ) -> Result<()> {
+        let call_id = tx.original.call_id_header().ok().map(|header| header.value().to_string());
         for module in modules.iter() {
             match module
                 .on_transaction_begin(token.clone(), tx, cookie.clone())
@@ -1718,6 +1822,7 @@ impl SipServer {
                 },
                 Err(e) => {
                     warn!(
+                        call_id = call_id.as_deref(),
                         key = %tx.key,
                         module = module.name(),
                         "failed to handle transaction: {}",
@@ -1737,7 +1842,7 @@ impl SipServer {
             match module.on_transaction_end(tx).await {
                 Ok(_) => {}
                 Err(e) => {
-                    warn!(key = %tx.key, "failed to handle transaction: {}", e);
+                    warn!(call_id = call_id.as_deref(), key = %tx.key, "failed to handle transaction: {}", e);
                 }
             }
         }
@@ -1954,6 +2059,9 @@ impl SipServerInner {
             .with_relay_ready_timeout_secs(rtp.relay_ready_timeout_secs)
             .with_stall_detect_secs(rtp.stall_detect_secs)
             .with_media_trace_interval_secs(rtp.media_trace_interval_secs)
+            .with_quality_stats(rtp.quality_stats.clone())
+            .with_volume_stats(rtp.volume_stats.clone())
+            .with_inband_dtmf(rtp.inband_dtmf)
     }
 
     /// Hot-reload the full `[proxy]` section plus related platform settings
@@ -2074,6 +2182,21 @@ impl SipServerInner {
         }
         if old.queue_hold_music != new_proxy.queue_hold_music {
             parts.push("queue_hold_music".to_string());
+        }
+        if old.queue_transfer_prompt_enabled != new_proxy.queue_transfer_prompt_enabled {
+            parts.push("queue_transfer_prompt_enabled".to_string());
+        }
+        if old.queue_comfort_prompt_enabled != new_proxy.queue_comfort_prompt_enabled {
+            parts.push("queue_comfort_prompt_enabled".to_string());
+        }
+        if old.queue_busy_prompt_enabled != new_proxy.queue_busy_prompt_enabled {
+            parts.push("queue_busy_prompt_enabled".to_string());
+        }
+        if old.queue_agent_ringback_enabled != new_proxy.queue_agent_ringback_enabled {
+            parts.push("queue_agent_ringback_enabled".to_string());
+        }
+        if old.queue_no_answer_prompt_enabled != new_proxy.queue_no_answer_prompt_enabled {
+            parts.push("queue_no_answer_prompt_enabled".to_string());
         }
         if old.voicemail_greeting != new_proxy.voicemail_greeting {
             parts.push("voicemail_greeting".to_string());
@@ -2264,23 +2387,41 @@ impl SipServerInner {
                     }
                 }
                 let realms_empty = proxy_config.realms.as_ref().map_or(true, |v| v.is_empty());
-                if self.endpoint.get_addrs().iter().any(|addr| {
-                    let addr_host = addr.addr.host.to_string();
-                    if addr_host == host {
-                        port.map(|p| addr.addr.port == Some(p.into()))
-                            .unwrap_or(true)
-                    } else if realms_empty && (addr_host == "0.0.0.0" || addr_host == "::") {
-                        port.map(|p| addr.addr.port == Some(p.into()))
-                            .unwrap_or(true)
-                    } else {
-                        false
-                    }
-                }) {
+                if Self::realm_matches_listen_addrs(
+                    host,
+                    port,
+                    &self.local_listen_addrs,
+                    realms_empty,
+                ) {
                     return true;
                 }
                 self.user_backend.is_same_realm(callee_realm).await
             }
         }
+    }
+
+    /// Compare a callee `host:port` realm against the startup listener
+    /// snapshot (`local_listen_addrs`). Pure function of its inputs so the
+    /// matching rules stay unit-testable; mirrors the previous
+    /// `Endpoint::get_addrs()` comparison exactly, minus the remote
+    /// connection addresses that must never be consulted: remote peers
+    /// (trunk gateways, NAT'd UAs) leaking into this check used to make
+    /// external realms look "same realm" and blackhole their calls.
+    fn realm_matches_listen_addrs(
+        host: &str,
+        port: Option<u16>,
+        listen_addrs: &[(String, Option<u16>)],
+        realms_empty: bool,
+    ) -> bool {
+        listen_addrs.iter().any(|(addr_host, addr_port)| {
+            if addr_host == host {
+                port.map(|p| *addr_port == Some(p)).unwrap_or(true)
+            } else if realms_empty && (addr_host == "0.0.0.0" || addr_host == "::") {
+                port.map(|p| *addr_port == Some(p)).unwrap_or(true)
+            } else {
+                false
+            }
+        })
     }
 
     /// Resolve the original-header passthrough rule for a callee destination.
@@ -2291,17 +2432,23 @@ impl SipServerInner {
     /// (`all` / `whitelist` / `blacklist` / `x_only`); a trunk without the
     /// config forwards no custom headers (legacy behaviour).
     ///
-    /// `trunk_dest_hint` is the `dest` string of the trunk the route table
-    /// actually selected (`OutboundTrunkContext.dest`), which is preferred
-    /// over matching `callee_uri` host:port against the trunk list.
+    /// `routed_trunk` is the name of the trunk the route table selected
+    /// (`OutboundTrunkContext.name`): its rule applies directly. Legs that
+    /// reach a trunk without a route (app/queue/transfer) fall back to
+    /// matching `callee_uri` host:port against the trunk list.
     pub async fn header_passthrough_for(
         &self,
         target: &crate::call::Location,
         callee_is_same_realm: bool,
         callee_uri: &rsipstack::sip::Uri,
-        trunk_dest_hint: Option<&str>,
+        routed_trunk: Option<&str>,
     ) -> Option<crate::proxy::routing::HeaderPassthrough> {
-        use crate::proxy::routing::{HeaderPassthrough, find_trunk_by_dest, trunk_dest_host_port};
+        use crate::proxy::routing::{HeaderPassthrough, find_trunk_by_dest};
+
+        let trunks = self.data_context.trunks_snapshot();
+        if let Some(name) = routed_trunk {
+            return trunks.get(name).and_then(|trunk| trunk.header_passthrough.clone());
+        }
 
         let internal =
             callee_is_same_realm || target.registered_aor.is_some() || target.home_proxy.is_some();
@@ -2309,16 +2456,9 @@ impl SipServerInner {
             return Some(HeaderPassthrough::all());
         }
 
-        let trunks = self.data_context.trunks_snapshot();
-        let matched = trunk_dest_hint
-            .and_then(trunk_dest_host_port)
-            .and_then(|(host, port)| find_trunk_by_dest(&trunks, &host, port))
-            .or_else(|| {
-                let host = callee_uri.host().to_string();
-                let port = callee_uri.host_with_port.port.map(|p| p.0).unwrap_or(5060);
-                find_trunk_by_dest(&trunks, &host, port)
-            });
-        matched.and_then(|trunk| trunk.header_passthrough.clone())
+        let host = callee_uri.host().to_string();
+        let port = callee_uri.host_with_port.port.map(|p| p.0).unwrap_or(5060);
+        find_trunk_by_dest(&trunks, &host, port).and_then(|trunk| trunk.header_passthrough.clone())
     }
 }
 
@@ -2342,11 +2482,7 @@ fn resolve_cluster_self_addr_with_interfaces(
     local_addr_strs: &[String],
     interface_ips: &std::collections::HashSet<String>,
 ) -> Option<SipAddr> {
-    let matched = peers.iter().find(|p| {
-        let peer_sip_addr = format!("{}:{}", p.addr, p.sip_port);
-        local_addr_strs.iter().any(|la| la == &peer_sip_addr)
-    });
-    let matched = match matched {
+    let matched = match crate::config::match_self_peer_by_listeners(peers, local_addr_strs) {
         Some(peer) => peer,
         None => {
             let wildcard = local_addr_strs.iter().any(|la| {
@@ -2356,7 +2492,7 @@ fn resolve_cluster_self_addr_with_interfaces(
             if !wildcard {
                 return None;
             }
-            peers.iter().find(|p| interface_ips.contains(&p.addr))?
+            crate::config::match_self_peer_by_interfaces(peers, interface_ips)?
         }
     };
     let peer_sip_addr = format!("{}:{}", matched.addr, matched.sip_port);
@@ -2442,6 +2578,43 @@ mod contact_uri_tests {
     use super::*;
     use crate::config::{ClusterPeer, SipContactConfig};
     use rsipstack::sip::HostWithPort;
+
+    #[tokio::test]
+    async fn transaction_log_correlation_preserves_complete_sip_call_id() {
+        use crate::proxy::tests::common::{create_test_request, create_test_server, create_transaction};
+
+        let (logs, _log_guard, _interest) = crate::log_capture::LogCapture::start();
+        let (inner, config) = create_test_server().await;
+        let proxy = SipServer {
+            modules: Arc::new(vec![Box::new(crate::proxy::call::CallModule::new(config, inner.clone()))]),
+            inner,
+        };
+        let mut request = create_test_request(rsipstack::sip::Method::Options, "alice", None, "example.test", None);
+        request.headers.unique_push(rsipstack::sip::Header::To(
+            rsipstack::sip::headers::To::new("<sip:alice@example.test>;tag=remote-tag")));
+        let call_id = request.call_id_header().unwrap().value().to_string();
+        let (tx, _endpoint) = create_transaction(request).await;
+        let (sender, incoming) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(tx).unwrap();
+        drop(sender);
+        proxy.handle_incoming(incoming).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !logs.text().contains("transaction processed in") {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("transaction must finish");
+        let text = logs.text();
+        for message in ["call transaction begin", "transaction processed in"] {
+            let line = text.lines().find(|line| line.contains(message)).unwrap();
+            let actual = line.split_whitespace()
+                .find_map(|field| field.strip_prefix("call_id=")).unwrap();
+            assert_eq!(actual.trim_matches('"'), call_id, "{line}");
+        }
+        let found = logs.search(&call_id).await;
+        assert!(found.iter().any(|line| line.contains("call transaction begin")));
+        assert!(found.iter().any(|line| line.contains("transaction processed in")));
+        proxy.stop();
+    }
 
     #[tokio::test]
     async fn incoming_udp_contact_uses_packet_source_and_local_network_policy() -> anyhow::Result<()> {
@@ -2603,6 +2776,136 @@ mod contact_uri_tests {
         let uri = build_contact_uri("rustpbx", &addr, None);
 
         assert_eq!(uri.to_string(), "sip:rustpbx@192.0.2.20:5060");
+    }
+
+    #[test]
+    fn realm_listen_matches_exact_listener_host_and_port() {
+        let listens = vec![
+            ("192.168.1.10".to_string(), Some(15060u16)),
+            ("pbx.example.com".to_string(), Some(5060u16)),
+        ];
+        assert!(SipServerInner::realm_matches_listen_addrs(
+            "pbx.example.com",
+            Some(5060),
+            &listens,
+            false
+        ));
+        assert!(SipServerInner::realm_matches_listen_addrs(
+            "192.168.1.10",
+            Some(15060),
+            &listens,
+            false
+        ));
+    }
+
+    #[test]
+    fn realm_listen_matches_listener_host_without_port_in_realm() {
+        let listens = vec![("192.168.1.10".to_string(), Some(15060u16))];
+        // Callee realm with no ":port" → port None → any bound port matches.
+        assert!(SipServerInner::realm_matches_listen_addrs(
+            "192.168.1.10",
+            None,
+            &listens,
+            false
+        ));
+    }
+
+    #[test]
+    fn realm_listen_rejects_wrong_port_on_matching_host() {
+        let listens = vec![("192.168.1.10".to_string(), Some(15060u16))];
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "192.168.1.10",
+            Some(9999),
+            &listens,
+            false
+        ));
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "192.168.1.10",
+            Some(5060),
+            &listens,
+            false
+        ));
+    }
+
+    #[test]
+    fn realm_listen_wildcard_bind_matches_only_when_realms_empty() {
+        let listens = vec![("0.0.0.0".to_string(), Some(15060u16))];
+        // realms empty → wildcard bind answers any host on its bound port.
+        assert!(SipServerInner::realm_matches_listen_addrs(
+            "any.provider.net",
+            Some(15060),
+            &listens,
+            true
+        ));
+        // realms configured → wildcard bind must NOT claim foreign hosts.
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "any.provider.net",
+            Some(15060),
+            &listens,
+            false
+        ));
+        // Still port-sensitive on the wildcard bind.
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "8.8.8.8",
+            Some(5060),
+            &listens,
+            true
+        ));
+    }
+
+    #[test]
+    fn realm_listen_wildcard_ipv6_bind_matches_when_realms_empty() {
+        let listens = vec![("::".to_string(), Some(5060u16))];
+        assert!(SipServerInner::realm_matches_listen_addrs(
+            "203.0.113.9",
+            Some(5060),
+            &listens,
+            true
+        ));
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "203.0.113.9",
+            Some(5060),
+            &listens,
+            false
+        ));
+    }
+
+    /// Regression anchor for the transport-connection leak fix: remote peer
+    /// addresses (trunk gateways / NAT'd UAs / disconnected WS clients
+    /// accumulated in the transport connection cache) must never satisfy a
+    /// same-realm check. The old `endpoint.get_addrs()` path consulted them,
+    /// so a callee realm that happened to equal a cached remote `ip:port`
+    /// was routed internally and blackholed.
+    #[test]
+    fn realm_listen_ignores_remote_connection_addresses() {
+        let listens = vec![("10.0.0.5".to_string(), Some(5060u16))];
+        // A remote trunk peer cached in the connection table.
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "1.2.3.4",
+            Some(5080),
+            &listens,
+            false
+        ));
+        // Remote host that even shares our listen port.
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "1.2.3.4",
+            Some(5060),
+            &listens,
+            false
+        ));
+    }
+
+    #[test]
+    fn realm_listen_empty_snapshot_never_matches() {
+        // Defensive: a server with no captured listeners must not claim
+        // same-realm via this path (call falls through to user_backend).
+        let listens: Vec<(String, Option<u16>)> = vec![];
+        assert!(!SipServerInner::realm_matches_listen_addrs(
+            "192.168.1.10",
+            Some(5060),
+            &listens,
+            true
+        ));
     }
 
     #[test]

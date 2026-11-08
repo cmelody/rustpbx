@@ -132,6 +132,32 @@
                             <span x-text="record.route_name"></span>
                         </span>
                     </template>
+                    <template x-if="record.agent || record.agent_id">
+                        <span class="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-3 py-1 text-[11px] font-semibold text-indigo-700"
+                            :title="record.agent_id ? 'Agent ID: ' + record.agent_id : ''">
+                            <svg class="h-3 w-3" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M10 10a3 3 0 100-6 3 3 0 000 6z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M4 17a6 6 0 0112 0" />
+                            </svg>
+                            <span x-text="record.agent || record.agent_id"></span>
+                            <span class="font-mono text-indigo-500"
+                                x-show="record.agent && record.agent_id" x-text="'· ' + record.agent_id"></span>
+                        </span>
+                    </template>
+                    <template x-if="record.queue || record.skill_group">
+                        <span class="inline-flex items-center gap-1 rounded-full bg-teal-50 px-3 py-1 text-[11px] font-semibold text-teal-600"
+                            :title="record.skill_group ? 'Skill group: ' + record.skill_group : ''">
+                            <svg class="h-3 w-3" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M7 7a2 2 0 100-4 2 2 0 000 4z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M3 16a4 4 0 018 0" />
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 7.5a1.8 1.8 0 100-3.6 1.8 1.8 0 000 3.6z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M12 16a3.2 3.2 0 016.5 0" />
+                            </svg>
+                            <span x-text="record.queue || record.skill_group"></span>
+                            <span x-show="record.queue && record.skill_group && record.queue !== record.skill_group"
+                                x-text="'· ' + record.skill_group"></span>
+                        </span>
+                    </template>
                     <template x-if="record.self_ip">
                         <span
                             class="inline-flex items-center gap-1 rounded-full bg-violet-50 px-3 py-1 text-[11px] font-semibold text-violet-700"
@@ -162,7 +188,7 @@
             </div>
             <div class="flex flex-wrap items-center gap-3 text-sm">
                 <a :href="actions.download_cdr_json || '#'" download
-                    class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-4 py-2 font-semibold text-slate-600 transition hover:border-sky-300 hover:text-sky-700">
+                    class="inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border border-slate-200 px-4 py-2 font-semibold text-slate-600 transition hover:border-sky-300 hover:text-sky-700">
                     <svg class="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
                         <path stroke-linecap="round" stroke-linejoin="round"
                             d="M10 3v9m0 0l-3.5-3.5M10 12l3.5-3.5M4 15.5h12" />
@@ -447,6 +473,50 @@
                                 :src="recordingPlaybackUrl()"></audio>
                         </div>
                     </template>
+                    <!-- Per-leg video recordings ([recording.video]) -->
+                    <template x-if="recordingVideos().length > 0">
+                        <div class="mt-5 space-y-4 border-t border-slate-100 pt-4">
+                            <div>
+                                <p class="text-sm font-semibold text-slate-900">{{
+                                    "call_record_detail.video_recording_title" | t }}</p>
+                                <p class="text-xs text-slate-500">{{
+                                    "call_record_detail.video_recording_desc" | t }}</p>
+                            </div>
+                            <template x-for="video in recordingVideos()"
+                                :key="(video.unique_id || '') + (video.track_id || '')">
+                                <div class="rounded-lg border border-slate-200 bg-slate-900/5 p-3">
+                                    <div
+                                        class="mb-2 flex flex-col gap-1 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between">
+                                        <span class="font-semibold text-slate-700"
+                                            x-text="video.label || video.track_id"></span>
+                                        <span class="flex items-center gap-3">
+                                            <span x-show="video.duration_secs"
+                                                x-text="formatWaveformTimestamp(video.duration_secs)"></span>
+                                            <a v-if="video.playback_url" :href="video.playback_url"
+                                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 font-semibold text-slate-700 transition hover:border-sky-300 hover:text-sky-700"
+                                                target="_blank" rel="noopener">
+                                                <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none"
+                                                    stroke="currentColor" stroke-width="1.8">
+                                                    <path stroke-linecap="round" stroke-linejoin="round"
+                                                        d="M12 5v12m0 0l-4-4m4 4l4-4" />
+                                                </svg>
+                                                {{ "call_record_detail.video_download" | t }}
+                                            </a>
+                                        </span>
+                                    </div>
+                                    <template x-if="video.playback_url">
+                                        <video class="max-h-72 w-full rounded bg-black" controls preload="none"
+                                            :src="video.playback_url"></video>
+                                    </template>
+                                    <template x-if="!video.playback_url">
+                                        <div
+                                            class="rounded border border-dashed border-slate-200 px-3 py-4 text-center text-xs text-slate-400">
+                                            {{ "call_record_detail.video_unavailable" | t }}</div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+                    </template>
                     <template x-if="!record.recording || !record.recording.url">
                         <div
                             class="mt-4 rounded-lg border border-dashed border-slate-200 px-4 py-6 text-center text-xs text-slate-400">
@@ -560,13 +630,90 @@
                                             </template>
                                         </div>
                                         <p class="mt-0.5 text-sm text-slate-600" x-text="ev.message"></p>
-                                        <template x-if="hasTraceDetail(ev)">
-                                            <pre class="mt-1 max-h-40 overflow-auto rounded-md bg-slate-50 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed text-slate-500 ring-1 ring-slate-200"
-                                                x-text="traceDetail(ev)"></pre>
-                                        </template>
                                         <template x-if="ev.kind === 'play' && ev.duration_ms != null">
                                             <p class="mt-0.5 text-xs text-slate-400"
                                                 x-text="'duration: ' + formatTraceMs(ev.duration_ms) + (ev.interrupted ? ' · interrupted' : ' · completed')"></p>
+                                        </template>
+                                        <template x-if="hasTraceDetail(ev)">
+                                            <div class="mt-2">
+                                                <!-- Per-leg media stat cards (media_health snapshots) -->
+                                                <template x-if="traceLegs(ev).length">
+                                                    <div class="grid gap-2 lg:grid-cols-2">
+                                                        <template x-for="(leg, li) in traceLegs(ev)" :key="li">
+                                                            <div class="rounded-lg px-3 py-2 ring-1"
+                                                                :class="leg.stalled ? 'bg-red-50/40 ring-red-200' : 'bg-slate-50 ring-slate-200'">
+                                                                <div class="flex flex-wrap items-center gap-1.5">
+                                                                    <span class="text-[11px] font-semibold text-slate-700"
+                                                                        x-text="traceLegTitle(leg)"></span>
+                                                                    <template x-if="leg.codec">
+                                                                        <span
+                                                                            class="rounded bg-white px-1.5 py-0.5 font-mono text-[10px] font-medium text-slate-500 ring-1 ring-slate-200"
+                                                                            x-text="leg.codec"></span>
+                                                                    </template>
+                                                                    <template x-if="leg.transport_mode">
+                                                                        <span class="text-[10px] text-slate-400"
+                                                                            x-text="leg.transport_mode"></span>
+                                                                    </template>
+                                                                    <template x-if="leg.stalled">
+                                                                        <span
+                                                                            class="ml-auto rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-600">stalled</span>
+                                                                    </template>
+                                                                </div>
+                                                                <div
+                                                                    class="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[10px] text-slate-500">
+                                                                    <template x-for="stat in traceLegStats(leg)"
+                                                                        :key="stat.label">
+                                                                        <span>
+                                                                            <span class="text-slate-400"
+                                                                                x-text="stat.label"></span>
+                                                                            <span class="font-semibold text-slate-600"
+                                                                                x-text="stat.value"></span>
+                                                                        </span>
+                                                                    </template>
+                                                                </div>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                                <!-- Scalar detail fields (answer, play, error, queue, ...) -->
+                                                <template x-if="traceScalarRows(ev).length">
+                                                    <div class="grid gap-x-4 gap-y-1 sm:grid-cols-2">
+                                                        <template x-for="row in traceScalarRows(ev)" :key="row.key">
+                                                            <div class="flex min-w-0 items-baseline gap-1.5 text-xs">
+                                                                <span class="shrink-0 text-slate-400"
+                                                                    x-text="row.label"></span>
+                                                                <template x-if="row.href">
+                                                                    <a :href="row.href" target="_blank" rel="noopener"
+                                                                        class="min-w-0 truncate font-mono text-[11px] text-sky-600 hover:underline"
+                                                                        x-text="row.value"></a>
+                                                                </template>
+                                                                <template x-if="!row.href">
+                                                                    <span class="min-w-0 truncate font-mono text-[11px] text-slate-600"
+                                                                        :title="row.value" x-text="row.value"></span>
+                                                                </template>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                                <!-- Full raw JSON, collapsed by default -->
+                                                <div class="mt-2">
+                                                    <button type="button"
+                                                        class="inline-flex items-center gap-1 text-[11px] font-medium text-slate-400 transition hover:text-slate-600"
+                                                        @click="toggleTraceDetail(i)">
+                                                        <svg xmlns="http://www.w3.org/2000/svg"
+                                                            class="h-3 w-3 transition-transform"
+                                                            :class="traceDetailOpen[i] ? '' : '-rotate-90'" viewBox="0 0 24 24"
+                                                            fill="none" stroke="currentColor" stroke-width="2"
+                                                            stroke-linecap="round" stroke-linejoin="round">
+                                                            <path d="m6 9 6 6 6-6" />
+                                                        </svg>
+                                                        <span x-text="traceRawLabel()"></span>
+                                                    </button>
+                                                    <pre x-show="traceDetailOpen[i]" x-cloak
+                                                        class="mt-1 max-h-40 overflow-auto rounded-md bg-slate-50 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed text-slate-500 ring-1 ring-slate-200"
+                                                        x-text="traceDetail(ev)"></pre>
+                                                </div>
+                                            </div>
                                         </template>
                                     </div>
                                 </li>
@@ -790,150 +937,86 @@
                         <template x-if="!sipFlowLoading && sipMessages.length > 0">
                             <div class="flex gap-4">
                                 <!-- Left: Timeline (3/5) -->
-                                <div class="flex-1 w-3/5 flex flex-col gap-4">
-                                    <!-- Timeline Header -->
-                                    <div
-                                        class="grid grid-cols-[90px_1fr_1fr_1fr] gap-2 px-4 py-2 bg-slate-50 rounded-lg border border-slate-200">
-                                        <div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide">
-                                            Time</div>
-                                        <div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide text-center"
-                                            x-text="getParticipantLabel('caller')">Caller</div>
-                                        <div
-                                            class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide text-center">
-                                            PBX</div>
-                                        <div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide text-center"
-                                            x-text="getParticipantLabel('callee')">Callee</div>
-                                    </div>
+                                <div class="flex-1 w-3/5 min-w-0 flex flex-col gap-4">
+                                    <!-- Timeline: one column per participant (caller, PBX, then each other dialog) -->
+                                    <div class="overflow-x-auto">
+                                        <div class="grid items-end px-4 py-2 bg-slate-50 rounded-lg border border-slate-200"
+                                            :style="sipGridStyle()">
+                                            <div class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide">
+                                                Time</div>
+                                            <template x-for="lane in sipLanes" :key="'lane-' + lane.id">
+                                                <div class="px-1 text-center" :title="lane.title || ''">
+                                                    <div class="truncate text-[10px] font-semibold text-slate-500 uppercase tracking-wide"
+                                                        x-text="lane.label"></div>
+                                                    <div class="truncate font-mono text-[10px] text-slate-400" x-show="lane.sub"
+                                                        x-text="lane.sub"></div>
+                                                </div>
+                                            </template>
+                                        </div>
 
-                                    <!-- Timeline Messages -->
-                                    <div class="space-y-0.5 max-h-[calc(100vh-280px)] overflow-y-auto">
-                                        <template x-for="(entry, idx) in sipMessages"
-                                            :key="'msg-' + idx + '-' + entry.timestamp">
-                                            <div class="grid grid-cols-[90px_1fr_1fr_1fr] gap-2 items-center px-4 py-1 hover:bg-sky-50/50 transition-colors cursor-pointer group relative rounded"
-                                                @click="selectedSipEntry = entry"
-                                                :class="selectedSipEntry === entry ? 'bg-sky-50' : ''">
+                                        <!-- Timeline Messages -->
+                                        <div class="space-y-0.5 max-h-[calc(100vh-280px)] overflow-y-auto">
+                                            <template x-for="(entry, idx) in sipMessages"
+                                                :key="'msg-' + idx + '-' + entry.timestamp">
+                                                <div class="grid items-center px-4 py-1 hover:bg-sky-50/50 transition-colors cursor-pointer group relative rounded"
+                                                    :style="sipGridStyle()"
+                                                    @click="selectedSipEntry = entry"
+                                                    :class="selectedSipEntry === entry ? 'bg-sky-50' : ''">
 
-                                                <!-- Time Column -->
-                                                <div class="text-[10px] font-mono text-slate-500"
-                                                    x-text="formatDateTimeWithMs(entry.timestamp)"></div>
+                                                    <!-- Time Column -->
+                                                    <div class="text-[10px] font-mono text-slate-500"
+                                                        x-text="formatDateTimeWithMs(entry.timestamp)"></div>
 
-                                                <!-- Caller Column -->
-                                                <div class="relative">
-                                                    <template x-if="entry._renderSrcRole === 'leg-a'">
-                                                        <div>
-                                                            <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
-                                                                :class="getMessageColorClass(entry.raw_message)">
-                                                                <div class="font-semibold whitespace-nowrap"
-                                                                    x-text="extractSipMethod(entry.raw_message)"></div>
-                                                            </div>
-                                                            <!-- Arrow Right -->
-                                                            <div
-                                                                class="absolute left-full top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
-                                                                <svg class="w-6 h-2 text-sky-400" viewBox="0 0 24 8"
-                                                                    fill="none">
-                                                                    <line x1="0" y1="4" x2="18" y2="4"
-                                                                        stroke="currentColor" stroke-width="1.5" />
-                                                                    <polygon points="18,0 24,4 18,8"
-                                                                        fill="currentColor" />
-                                                                </svg>
-                                                            </div>
+                                                    <template x-for="(lane, li) in sipLanes" :key="'cell-' + idx + '-' + lane.id">
+                                                        <div class="relative flex min-h-[28px] items-center">
+                                                            <!-- Sender: message box with its line toward the receiver -->
+                                                            <template x-if="laneCellKind(entry, li) === 'src'">
+                                                                <div class="flex w-full items-center"
+                                                                    :class="laneDir(entry) === 'right' ? 'pl-1' : 'pr-1'"
+                                                                    :style="laneDir(entry) === 'right' ? '' : 'flex-direction: row-reverse'">
+                                                                    <div class="shrink-0 rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
+                                                                        :class="getMessageColorClass(entry.raw_message)">
+                                                                        <div class="font-semibold whitespace-nowrap"
+                                                                            x-text="extractSipMethod(entry.raw_message)"></div>
+                                                                    </div>
+                                                                    <div class="h-px flex-1 bg-slate-300"></div>
+                                                                </div>
+                                                            </template>
+                                                            <!-- Columns the message passes over -->
+                                                            <template x-if="laneCellKind(entry, li) === 'span'">
+                                                                <div class="h-px w-full bg-slate-300"></div>
+                                                            </template>
+                                                            <!-- Receiver: arrowhead -->
+                                                            <template x-if="laneCellKind(entry, li) === 'dst'">
+                                                                <div class="flex w-full items-center"
+                                                                    :style="laneDir(entry) === 'right' ? '' : 'flex-direction: row-reverse'">
+                                                                    <div class="h-px w-1/2 bg-slate-300"></div>
+                                                                    <svg class="h-2 w-2 shrink-0 text-slate-400" viewBox="0 0 6 8" fill="currentColor">
+                                                                        <polygon :points="laneDir(entry) === 'right' ? '0,0 6,4 0,8' : '6,0 0,4 6,8'" />
+                                                                    </svg>
+                                                                </div>
+                                                            </template>
+                                                            <!-- PBX internal or unresolved messages -->
+                                                            <template x-if="laneCellKind(entry, li) === 'self'">
+                                                                <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md border-dashed"
+                                                                    :class="getMessageColorClass(entry.raw_message)">
+                                                                    <div class="font-semibold whitespace-nowrap"
+                                                                        x-text="extractSipMethod(entry.raw_message)"></div>
+                                                                </div>
+                                                            </template>
+                                                            <template x-if="laneCellKind(entry, li) === 'unknown'">
+                                                                <div class="rounded-lg border border-dashed border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 shadow-sm transition hover:shadow-md">
+                                                                    <div class="font-semibold whitespace-nowrap">
+                                                                        <span class="mr-1">?</span>
+                                                                        <span x-text="extractSipMethod(entry.raw_message)"></span>
+                                                                    </div>
+                                                                </div>
+                                                            </template>
                                                         </div>
                                                     </template>
                                                 </div>
-
-                                                <!-- PBX Column -->
-                                                <div class="relative">
-                                                    <!-- PBX to Caller (PBX sends response back) -->
-                                                    <template
-                                                        x-if="entry._renderSrcRole === 'pbx' && entry._renderDstRole === 'leg-a'">
-                                                        <div>
-                                                            <!-- Arrow Left -->
-                                                            <div
-                                                                class="absolute right-full top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
-                                                                <svg class="w-6 h-2 text-emerald-400" viewBox="0 0 24 8"
-                                                                    fill="none">
-                                                                    <polygon points="6,0 0,4 6,8" fill="currentColor" />
-                                                                    <line x1="6" y1="4" x2="24" y2="4"
-                                                                        stroke="currentColor" stroke-width="1.5" />
-                                                                </svg>
-                                                            </div>
-                                                            <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
-                                                                :class="getMessageColorClass(entry.raw_message)">
-                                                                <div class="font-semibold whitespace-nowrap"
-                                                                    x-text="extractSipMethod(entry.raw_message)"></div>
-                                                            </div>
-                                                        </div>
-                                                    </template>
-
-                                                    <!-- PBX to Callee (PBX forwards request) -->
-                                                    <template
-                                                        x-if="entry._renderSrcRole === 'pbx' && entry._renderDstRole === 'leg-b'">
-                                                        <div>
-                                                            <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
-                                                                :class="getMessageColorClass(entry.raw_message)">
-                                                                <div class="font-semibold whitespace-nowrap"
-                                                                    x-text="extractSipMethod(entry.raw_message)"></div>
-                                                            </div>
-                                                            <!-- Arrow Right -->
-                                                            <div
-                                                                class="absolute left-full top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
-                                                                <svg class="w-6 h-2 text-indigo-400" viewBox="0 0 24 8"
-                                                                    fill="none">
-                                                                    <line x1="0" y1="4" x2="18" y2="4"
-                                                                        stroke="currentColor" stroke-width="1.5" />
-                                                                    <polygon points="18,0 24,4 18,8"
-                                                                        fill="currentColor" />
-                                                                </svg>
-                                                            </div>
-                                                        </div>
-                                                    </template>
-
-                                                    <!-- PBX internal messages -->
-                                                    <template
-                                                        x-if="entry._renderSrcRole === 'pbx' && entry._renderDstRole === 'pbx'">
-                                                        <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md border-dashed"
-                                                            :class="getMessageColorClass(entry.raw_message)">
-                                                            <div class="font-semibold whitespace-nowrap"
-                                                                x-text="extractSipMethod(entry.raw_message)"></div>
-                                                        </div>
-                                                    </template>
-
-                                                    <template
-                                                        x-if="!entry._renderSrcRole || !entry._renderDstRole">
-                                                        <div class="rounded-lg border border-dashed border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 shadow-sm transition hover:shadow-md">
-                                                            <div class="font-semibold whitespace-nowrap">
-                                                                <span class="mr-1">?</span>
-                                                                <span x-text="extractSipMethod(entry.raw_message)"></span>
-                                                            </div>
-                                                        </div>
-                                                    </template>
-                                                </div>
-
-                                                <!-- Callee Column -->
-                                                <div class="relative">
-                                                    <!-- Only show messages FROM leg-b (callee sends) -->
-                                                    <template x-if="entry._renderSrcRole === 'leg-b'">
-                                                        <div>
-                                                            <!-- Arrow Left -->
-                                                            <div
-                                                                class="absolute right-full top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
-                                                                <svg class="w-6 h-2 text-purple-400" viewBox="0 0 24 8"
-                                                                    fill="none">
-                                                                    <polygon points="6,0 0,4 6,8" fill="currentColor" />
-                                                                    <line x1="6" y1="4" x2="24" y2="4"
-                                                                        stroke="currentColor" stroke-width="1.5" />
-                                                                </svg>
-                                                            </div>
-                                                            <div class="rounded-lg border px-2 py-1 text-xs shadow-sm transition hover:shadow-md"
-                                                                :class="getMessageColorClass(entry.raw_message)">
-                                                                <div class="font-semibold whitespace-nowrap"
-                                                                    x-text="extractSipMethod(entry.raw_message)"></div>
-                                                            </div>
-                                                        </div>
-                                                    </template>
-                                                </div>
-                                            </div>
-                                        </template>
+                                            </template>
+                                        </div>
                                     </div>
                                 </div>
 
@@ -1087,6 +1170,7 @@
                     ? ((recordingSegments[0].unique_id && String(recordingSegments[0].unique_id).trim()) || recordingSegments[0].track_id || '')
                     : '';
                 this.trace = Array.isArray(data.trace) ? data.trace : [];
+                this.traceDetailOpen = {};
                 const recordRewrite = (this.record && this.record.rewrite && typeof this.record.rewrite === 'object')
                     ? this.record.rewrite
                     : null;
@@ -1176,7 +1260,9 @@
             },
             record: {},
             trace: [],
+            traceDetailOpen: {},
             sipFlowEntries: [],
+            sipLanes: [],
             sipMessages: [],
             sipFlowColumns: [],
             sipFlowLoading: false,
@@ -2205,6 +2291,15 @@
                 }
                 this.waveformOriginalBuffer = null;
             },
+            // Per-leg video artifacts ([recording.video]) — MP4 segments
+            // carrying `media_kind = "video"`, each playable on its own URL.
+            recordingVideos() {
+                const segments = (this.record && this.record.recording
+                    && Array.isArray(this.record.recording.segments))
+                    ? this.record.recording.segments
+                    : [];
+                return segments.filter((seg) => seg && seg.media_kind === 'video');
+            },
             recordingPlaybackUrl() {
                 if (!this.record || !this.record.recording || !this.record.recording.url) {
                     return '';
@@ -2593,6 +2688,12 @@
                     case 'media_health':
                         // signal (per-leg media counters snapshot)
                         return svg('M2 20h.01M7 20v-4m5 4v-8m5 4V8m5 4v8');
+                    case 'recording':
+                        // dot-in-circle (record lifecycle)
+                        return svg('M12 21a9 9 0 110-18 9 9 0 010 18zM12 15a3 3 0 110-6 3 3 0 010 6z');
+                    case 'dialplan':
+                        // adjustments-horizontal (resolved call parameters)
+                        return svg('M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75');
                     case 'error':
                         // exclamation-triangle (call-affecting subsystem error)
                         return svg('M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z');
@@ -2625,13 +2726,19 @@
                     rtp_timeout: 'RTP timeout',
                     media_issue: 'Media issue',
                     media_health: 'Media health',
+                    recording: 'Recording',
+                    dialplan: 'Dialplan',
                     error: 'Error',
                     end: 'Call end',
                 };
                 return map[kind] || kind;
             },
             hasTraceDetail(ev) {
-                return ev && ev.detail != null && (ev.kind === 'error' || ev.kind === 'media_health');
+                if (!ev || ev.detail == null) return false;
+                if (typeof ev.detail !== 'object') return true;
+                return Array.isArray(ev.detail)
+                    || this.traceLegs(ev).length > 0
+                    || this.traceScalarRows(ev).length > 0;
             },
             traceDetail(ev) {
                 if (!ev || ev.detail == null) return '';
@@ -2642,6 +2749,105 @@
                 } catch (e) {
                     return String(ev.detail);
                 }
+            },
+            traceTd() {
+                return (this.t && this.t.call_record_detail) || {};
+            },
+            traceRawLabel() {
+                return this.traceTd().trace_raw_json || 'Raw JSON';
+            },
+            toggleTraceDetail(i) {
+                this.traceDetailOpen = { ...this.traceDetailOpen, [i]: !this.traceDetailOpen[i] };
+            },
+            traceLegs(ev) {
+                const legs = ev && ev.detail && ev.detail.legs;
+                return Array.isArray(legs) ? legs : [];
+            },
+            traceLegTitle(leg) {
+                return (leg && (leg.side || leg.leg_id)) || 'leg';
+            },
+            traceLegStats(leg) {
+                if (!leg || typeof leg !== 'object') return [];
+                const stats = [];
+                if (leg.ingress_packets != null) stats.push({ label: 'rx', value: leg.ingress_packets });
+                if (leg.egress_packets != null) stats.push({ label: 'tx', value: leg.egress_packets });
+                if (leg.fraction_lost_pct != null) stats.push({ label: 'loss', value: this.formatTracePct(leg.fraction_lost_pct) });
+                if (leg.jitter_ms != null) stats.push({ label: 'jitter', value: this.traceMs(leg.jitter_ms) });
+                if (leg.rtt_ms != null) stats.push({ label: 'rtt', value: this.traceMs(leg.rtt_ms) });
+                return stats;
+            },
+            traceScalarRows(ev) {
+                const d = ev && ev.detail;
+                if (!d || typeof d !== 'object' || Array.isArray(d)) return [];
+                const rows = [];
+                for (const [key, value] of Object.entries(d)) {
+                    // `legs` is rendered as stat cards; nested objects fall back to raw JSON.
+                    if (key === 'legs') continue;
+                    if (value === null || value === undefined || value === '') continue;
+                    if (typeof value === 'object') continue;
+                    rows.push({
+                        key,
+                        label: this.traceRowLabel(key),
+                        value: this.traceRowValue(key, value),
+                        href: this.traceRowHref(key, value),
+                    });
+                }
+                return rows;
+            },
+            traceRowLabel(key) {
+                const named = {
+                    agent: 'agent',
+                    agent_id: 'agent id',
+                    agent_name: 'agent name',
+                    bytes: 'size',
+                    duration_ms: 'duration',
+                    duration_secs: 'duration',
+                    queue_name: 'queue',
+                    queue_label: 'queue label',
+                    route_age_secs: 'route age',
+                    skill_group: 'skill group',
+                    track_id: 'track',
+                };
+                return named[key] || String(key).replace(/_/g, ' ');
+            },
+            traceRowValue(key, value) {
+                if (typeof value === 'boolean') return value ? 'yes' : 'no';
+                if (typeof value === 'number') {
+                    if (key === 'bytes' || key.endsWith('_bytes')) return this.humanTraceBytes(value);
+                    if (key === 'duration_ms' || key.endsWith('_ms')) return this.traceMs(value);
+                    if (key === 'duration_secs' || key.endsWith('_secs')) return this.traceSecs(value);
+                }
+                return String(value);
+            },
+            traceRowHref(key, value) {
+                if (typeof value !== 'string') return null;
+                if (key !== 'url' && !key.endsWith('_url')) return null;
+                return value.startsWith('http://') || value.startsWith('https://') ? value : null;
+            },
+            humanTraceBytes(n) {
+                const v = Number(n) || 0;
+                if (v >= 1024 * 1024) return (v / (1024 * 1024)).toFixed(1) + ' MB';
+                if (v >= 1024) return (v / 1024).toFixed(1) + ' KB';
+                return v + ' B';
+            },
+            traceMs(v) {
+                const n = Number(v) || 0;
+                if (n >= 1000) return (n / 1000).toFixed(1) + 's';
+                if (n >= 10) return Math.round(n) + 'ms';
+                return (Math.round(n * 100) / 100) + 'ms';
+            },
+            traceSecs(v) {
+                const n = Number(v) || 0;
+                if (n >= 60) {
+                    const m = Math.floor(n / 60);
+                    return m + 'm ' + Math.round(n - m * 60) + 's';
+                }
+                return n.toFixed(1) + 's';
+            },
+            formatTracePct(v) {
+                const n = Number(v) || 0;
+                const rounded = Math.round(n * 100) / 100;
+                return (Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')) + '%';
             },
             formatTraceTs(ts) {
                 const v = Number(ts) || 0;
@@ -2963,11 +3169,110 @@
             applyEntryRoles() {
                 if (!this.sipFlowEntries || this.sipFlowEntries.length === 0) return;
 
+                const calleeLanes = this.buildSipLanes();
+                const laneOf = (role, entry) => {
+                    if (role === 'leg-a') return 0;
+                    if (role === 'pbx') return 1;
+                    if (role === 'leg-b') return calleeLanes.get(entry.call_id) ?? 2;
+                    return null;
+                };
                 this.sipFlowEntries.forEach((entry) => {
                     const resolved = this.resolveEntryRoles(entry);
                     entry._renderSrcRole = resolved.srcRole;
                     entry._renderDstRole = resolved.dstRole;
+                    entry._srcLane = laneOf(resolved.srcRole, entry);
+                    entry._dstLane = laneOf(resolved.dstRole, entry);
                 });
+            },
+
+            // Columns: caller, PBX, then one per other dialog (Call-ID) in the
+            // order it started — sequential attempts, transfer targets and
+            // other legs each get their own. Returns Call-ID → column index.
+            buildSipLanes() {
+                const callees = new Map();
+                for (const entry of this.sipMessages) {
+                    if (this.normalizeLegRole(entry?.role) !== 'callee') continue;
+                    if (!callees.has(entry.call_id)) {
+                        callees.set(entry.call_id, { callId: entry.call_id, first: entry, invite: null });
+                    }
+                    const callee = callees.get(entry.call_id);
+                    const meta = entry._sipMeta;
+                    if (!callee.invite && meta?.isRequest && meta?.method === 'INVITE') {
+                        callee.invite = entry;
+                    }
+                }
+                const lanes = [
+                    { id: 'caller', label: this.getParticipantLabel('caller'), sub: '' },
+                    { id: 'pbx', label: 'PBX', sub: '' },
+                ];
+                const index = new Map();
+                const list = Array.from(callees.values());
+                if (list.length <= 1) {
+                    lanes.push({ id: 'callee', label: this.getParticipantLabel('callee'), sub: '' });
+                    list.forEach((callee) => index.set(callee.callId, 2));
+                    this.sipLanes = lanes;
+                    return index;
+                }
+                // Sequential attempts are traced with their target; match a
+                // dialog to its attempt by the INVITE's Request-URI.
+                const attempts = new Map();
+                for (const ev of this.trace || []) {
+                    const detail = ev?.detail;
+                    if (!detail || typeof detail.attempt !== 'number' || !detail.target) continue;
+                    const known = attempts.get(detail.attempt) || {};
+                    attempts.set(detail.attempt, { ...known, ...detail });
+                }
+                const unmatched = Array.from(attempts.values());
+                list.forEach((callee) => {
+                    const uri = callee.invite ? this.sipRequestUri(callee.invite.raw_message) : '';
+                    const remote = this.normalizeAddr(callee.invite ? callee.invite.dst_addr : callee.first.src_addr);
+                    const at = unmatched.findIndex((attempt) => this.sameSipUri(attempt.target, uri));
+                    const attempt = at >= 0 ? unmatched.splice(at, 1)[0] : null;
+                    const label = attempt
+                        ? `#${attempt.attempt + 1}${attempt.trunk ? ' · ' + attempt.trunk : ''}`
+                        : (this.sipUriUserHost(uri) || remote || 'Callee');
+                    const sub = [remote, attempt && attempt.status ? String(attempt.status) : '']
+                        .filter(Boolean).join(' · ');
+                    index.set(callee.callId, lanes.length);
+                    lanes.push({ id: 'callee:' + callee.callId, label, sub, title: `${uri || remote} — ${callee.callId}` });
+                });
+                this.sipLanes = lanes;
+                return index;
+            },
+
+            sipGridStyle() {
+                const lanes = Math.max(this.sipLanes.length, 3);
+                return `grid-template-columns: 90px repeat(${lanes}, minmax(96px, 1fr));`;
+            },
+
+            laneCellKind(entry, laneIndex) {
+                const src = entry?._srcLane;
+                const dst = entry?._dstLane;
+                if (src == null || dst == null) return laneIndex === 1 ? 'unknown' : null;
+                if (src === dst) return laneIndex === src ? 'self' : null;
+                if (laneIndex === src) return 'src';
+                if (laneIndex === dst) return 'dst';
+                if (laneIndex > Math.min(src, dst) && laneIndex < Math.max(src, dst)) return 'span';
+                return null;
+            },
+
+            laneDir(entry) {
+                return entry?._dstLane > entry?._srcLane ? 'right' : 'left';
+            },
+
+            sipRequestUri(message) {
+                const firstLine = ((message || '').split(/\r?\n/)[0] || '').trim();
+                const match = firstLine.match(/^[A-Z]+\s+(\S+)\s+SIP\/\d\.\d$/i);
+                return match ? match[1] : '';
+            },
+
+            sipUriUserHost(uri) {
+                return (uri || '').replace(/^sips?:/i, '').split(/[;?>]/)[0];
+            },
+
+            sameSipUri(left, right) {
+                const a = this.sipUriUserHost(left).toLowerCase();
+                return !!a && a === this.sipUriUserHost(right).toLowerCase();
             },
 
             resolveEntryRoles(entry) {

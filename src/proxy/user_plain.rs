@@ -67,13 +67,13 @@ impl PlainTextBackend {
                 call_forwarding_mode: None,
                 call_forwarding_destination: None,
                 call_forwarding_timeout: None,
-                departments: None,
+                department_ids: Vec::new(),
                 display_name: None,
                 email: None,
                 phone: None,
                 note: None,
                 allow_guest_calls: false,
-                voicemail_disabled: false,
+                voicemail_disabled: true,
             };
             self.users.insert(username.to_string(), user);
         }

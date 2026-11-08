@@ -89,9 +89,14 @@ pub async fn get_call_record_transcript(
             }))
             .into_response()
         }
+        // Keep the stored status so the console can tell a failed or lost
+        // transcript apart from one that was never requested.
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "message": "Transcript not available" })),
+            Json(json!({
+                "message": "Transcript not available",
+                "status": record.transcript_status,
+            })),
         )
             .into_response(),
         Err(err) => {
@@ -576,6 +581,11 @@ async fn load_stored_transcript(
         let mut fallback = PathBuf::from(&cdr_data.cdr_path);
         fallback.set_extension("transcript.json");
         candidates.push(fallback.to_string_lossy().into_owned());
+    } else if let Some(recording) = select_recording_path(record, None) {
+        // Without a CDR file the transcript is written next to the recording.
+        let mut fallback = PathBuf::from(recording);
+        fallback.set_extension("transcript.json");
+        candidates.push(fallback.to_string_lossy().into_owned());
     }
 
     candidates.retain(|candidate| !candidate.trim().is_empty());
@@ -602,13 +612,6 @@ async fn load_stored_transcript(
 }
 
 fn resolve_models_path(cfg: &TranscriptConfig) -> Option<String> {
-    if let Ok(env_path) = std::env::var("MODEL_PATH") {
-        let trimmed = env_path.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
     cfg.models_path
         .as_ref()
         .map(|value| value.trim())
@@ -766,8 +769,8 @@ pub async fn get_settings(
 
     let cfg = get_merged_config(&app_state).await;
 
-    let model_ready = if let Some(path) = &cfg.models_path {
-        let model_file = model_file_path(path);
+    let model_ready = if let Some(path) = resolve_models_path(&cfg) {
+        let model_file = model_file_path(&path);
         tokio::fs::metadata(&model_file)
             .await
             .map(|meta| meta.is_file())
@@ -922,13 +925,9 @@ pub async fn download_model(
             .into_response();
     }
 
-    // Prefer models_path from config, fall back to request body
-    let models_path = transcript_cfg
-        .models_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| p.to_string())
+    // Same resolution as transcribing (MODEL_PATH, then config), so the
+    // model lands where transcription looks; fall back to the request body.
+    let models_path = resolve_models_path(&transcript_cfg)
         .or_else(|| payload.models_path.as_ref().map(|p| p.trim().to_string()))
         .filter(|p| !p.is_empty());
 

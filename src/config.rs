@@ -26,6 +26,18 @@ pub const DEFAULT_IVR_MODE: &str = "tree";
 /// Product brand name.
 pub const BRAND_NAME: &str = "RustPBX";
 
+/// Encoding of passwords minted for shared-secret (TURN REST) entries.
+/// - `Base64` (default): padded Base64 over HMAC-SHA1, as issued by coturn.
+/// - `Hex`: lowercase hex over the same digest, as verified by miuturn's
+///   short-term credential manager.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialEncoding {
+    #[default]
+    Base64,
+    Hex,
+}
+
 /// An ICE server with optional settings for issuing temporary browser credentials.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct IceServerConfig {
@@ -36,6 +48,10 @@ pub struct IceServerConfig {
     /// Temporary credential lifetime in seconds; defaults to one hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime: Option<u64>,
+    /// Encoding of the minted TURN REST password; defaults to Base64
+    /// (coturn-compatible). Use `hex` when the TURN server is miuturn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<CredentialEncoding>,
 }
 
 impl std::fmt::Debug for IceServerConfig {
@@ -44,8 +60,68 @@ impl std::fmt::Debug for IceServerConfig {
             .field("server", &self.server)
             .field("secrete", &self.secrete.as_ref().map(|_| "[redacted]"))
             .field("lifetime", &self.lifetime)
+            .field("encoding", &self.encoding)
             .finish()
     }
+}
+
+/// Resolve browser ICE configuration from ICE server entries at the given
+/// Unix time (seconds). Static entries are preserved; shared-secret TURN
+/// credentials are minted per call and never cached server-side.
+pub fn mint_ice_servers(entries: &[IceServerConfig], now: u64) -> Result<Vec<IceServer>> {
+    let mut servers = Vec::new();
+    for entry in entries {
+        let Some(secret) = &entry.secrete else {
+            servers.push(entry.server.clone());
+            continue;
+        };
+        use hmac::{Hmac, KeyInit, Mac};
+
+        let turn = &entry.server;
+        let user = turn.username.as_deref().unwrap_or("rustpbx");
+        let lifetime = entry.lifetime.unwrap_or(3600);
+        anyhow::ensure!(!secret.is_empty(), "ice_servers.secrete must not be empty");
+        anyhow::ensure!(
+            turn.credential.is_none(),
+            "ice_servers cannot combine secrete and credential"
+        );
+        anyhow::ensure!(
+            turn.credential_type == rustrtc::IceCredentialType::Password,
+            "ice_servers.secrete requires password credentials"
+        );
+        anyhow::ensure!(
+            !turn.urls.is_empty()
+                && turn.urls.iter().all(|url| {
+                    url.strip_prefix("turn:")
+                        .or_else(|| url.strip_prefix("turns:"))
+                        .is_some_and(|host| !host.is_empty())
+                }),
+            "ice_servers with secrete must contain TURN URLs"
+        );
+        anyhow::ensure!(
+            !user.is_empty() && !user.contains(':'),
+            "ice_servers with secrete require a nonempty username suffix without a colon"
+        );
+        anyhow::ensure!(lifetime > 0, "ice_servers.lifetime must be positive");
+        let expires = now
+            .checked_add(lifetime)
+            .ok_or_else(|| anyhow::anyhow!("ice_servers.lifetime overflows expiry"))?;
+        let username = format!("{}:{}", expires, user);
+        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes())?;
+        mac.update(username.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        // TURN REST passwords use standard padded Base64, as in coturn;
+        // miuturn's short-term credential manager instead verifies hex.
+        let credential = match entry.encoding.unwrap_or_default() {
+            CredentialEncoding::Base64 => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                STANDARD.encode(digest)
+            }
+            CredentialEncoding::Hex => hex::encode(digest),
+        };
+        servers.push(turn.clone().with_credential(username, credential));
+    }
+    Ok(servers)
 }
 
 #[derive(Parser, Debug)]
@@ -114,6 +190,15 @@ fn default_nat_fix() -> bool {
 
 fn default_callid_suffix() -> Option<String> {
     Some("miuda.ai".to_string())
+}
+
+fn default_session_id_length() -> usize {
+    // Historical default: UUID v4 simple form (32 hex chars).
+    crate::call::session_id::LENGTH_MAX
+}
+
+fn default_session_id_inherit_callid() -> bool {
+    true
 }
 
 fn default_user_backends() -> Vec<UserBackendConfig> {
@@ -224,6 +309,9 @@ pub struct RecordingPolicy {
     /// `record start` actions, giving separate IVR / agent segments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_start_except: Vec<String>,
+    /// Delete the recording of a call that was never answered (only early
+    /// media was captured) instead of keeping and uploading it. Default false.
+    pub discard_unanswered: Option<bool>,
     pub filename_pattern: Option<String>,
     /// Live file output rate in Hz; explicit values select resampled PCM WAV.
     pub samplerate: Option<u32>,
@@ -276,9 +364,19 @@ pub struct RecordingPolicy {
     /// `type = "sipflow"` for SipFlow RTP capture. Kept for config compatibility.
     #[serde(default)]
     pub force_file: Option<bool>,
-    /// Swap stereo channels in recording: callee→left, caller→right.
+    /// Deprecated: use `stereo_mode` instead. Direct stereo channel swap,
+    /// honoured only when no layer configures `stereo_mode`.
     #[serde(default)]
     pub stereo_swap: Option<bool>,
+    /// Stereo channel assignment policy: `caller_left` (default),
+    /// `callee_left` (≈ legacy `stereo_swap = true`), `external_left`
+    /// (external party → left, internal → right) or `external_right`
+    /// (external party → right, internal → left).
+    /// The external policies fall back to caller-left / caller-right when the
+    /// sides cannot be distinguished. Configuring this at any layer supersedes
+    /// the legacy `stereo_swap`.
+    #[serde(default)]
+    pub stereo_mode: Option<crate::media::recorder::StereoChannelMode>,
     /// Local archival layout when `type = "local"`: `daily` (default) or
     /// `hourly`. Files are moved under `{path}/YYYYMMDD[/HH]/` after the call.
     #[serde(default)]
@@ -301,6 +399,13 @@ pub struct RecordingPolicy {
     /// Default 600 (10 minutes). Breaches increment a Prometheus counter.
     #[serde(default)]
     pub upload_sla_secs: Option<u64>,
+    /// Keep the local recording file for N days **after a successful upload**
+    /// before cleanup (acceptance §3.2.5 归档: 上传后本地保留 10 天). `0`
+    /// (default) = delete immediately on upload success (historical
+    /// behaviour). Files still pending upload (`.upload_failed` marker
+    /// present) are never swept. Sweep runs on the retry worker cycle.
+    #[serde(default)]
+    pub keep_local_days: Option<u32>,
     /// System-managed outbound ringback stage: when true, every originate
     /// call records its pre-answer slice (`segment_type = "ringing"`) without
     /// needing the per-request `record` option, and the slice is KEPT when the
@@ -316,6 +421,41 @@ pub struct RecordingPolicy {
     /// source has no entry uploads to the main bucket fields above.
     #[serde(default)]
     pub sources: Option<HashMap<String, RecordingS3Target>>,
+    /// Video call recording (P2P per-leg MP4). Off by default; when enabled,
+    /// a call whose negotiated SDP carries an H264 video m-line additionally
+    /// records each leg's video as `{base}_caller.mp4` / `{base}_callee.mp4`
+    /// next to the WAV artifact.
+    #[serde(default)]
+    pub video: Option<VideoRecordingConfig>,
+}
+
+/// `[recording.video]` — video recording options.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct VideoRecordingConfig {
+    /// Master switch. Video recording additionally requires the call to have
+    /// negotiated H264 video (`VideoPolicy::PassThrough` keeps video on the
+    /// legs; `Strip` removes it, leaving a plain audio recording).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Video codec to record. Only `h264` is supported today (VP8 negotiated
+    /// calls degrade to the audio-only WAV).
+    #[serde(default)]
+    pub codec: Option<String>,
+}
+
+impl VideoRecordingConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn h264_enabled(&self) -> bool {
+        self.enabled
+            && self
+                .codec
+                .as_deref()
+                .map(|codec| codec.eq_ignore_ascii_case("h264"))
+                .unwrap_or(true)
+    }
 }
 
 /// One `[recording.sources.<tag>]` entry: an independent S3-compatible upload
@@ -377,8 +517,10 @@ impl RecordingPolicy {
             enabled: self.enabled.unwrap_or(false),
             auto_start: self.auto_start.unwrap_or(true),
             auto_start_at: self.auto_start_at.unwrap_or_default(),
+            discard_unanswered: self.discard_unanswered.unwrap_or(false),
             recording_type: self.effective_recording_type(),
             stereo_swap: self.stereo_swap.unwrap_or(false),
+            stereo_mode: self.stereo_mode,
             option: None,
         }
     }
@@ -451,6 +593,12 @@ impl RecordingPolicy {
         self.upload_sla_secs.unwrap_or(600).max(1)
     }
 
+    /// Local retention (days) after a successful upload before cleanup.
+    /// `0` = delete immediately on upload success (historical behaviour).
+    pub fn effective_keep_local_days(&self) -> u32 {
+        self.keep_local_days.unwrap_or(0)
+    }
+
     /// Whether the system-managed outbound ringback stage should be recorded
     /// (`[recording].record_ringing`): captured for every originate call and
     /// kept even when the call is answered.
@@ -500,6 +648,11 @@ pub struct Config {
     /// Local stats log refresh interval in seconds. Default 5.
     #[serde(default = "default_stats_interval")]
     pub stats_interval: u64,
+    /// Seconds between `rustpbx_cdr_daily` rollup runs (today + yesterday
+    /// re-aggregated from raw CDRs). Only the console's day-bucket trunk
+    /// report reads that table. Default 300; 0 disables the rollup.
+    #[serde(default = "default_cdr_rollup_interval")]
+    pub cdr_rollup_interval: u64,
     #[serde(default)]
     pub log_rotation: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -559,6 +712,11 @@ pub struct Config {
     pub recording: Option<RecordingPolicy>,
     #[serde(default)]
     pub demo_mode: bool,
+    /// Explicit node identity (config-only; the former
+    /// `RUSTPBX_INSTANCE_ID` environment override). When unset the identity
+    /// falls back to the cluster peer self-match, then the system hostname.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     #[serde(default)]
@@ -596,6 +754,13 @@ pub struct Config {
     /// Graceful shutdown (drain) tuning — see `GracefulShutdownConfig`.
     #[serde(default)]
     pub graceful_shutdown: Option<GracefulShutdownConfig>,
+    /// Rolling process handover (container rolling release) — see
+    /// [`RollingConfig`]. **Enabled by default**: a config without a
+    /// `[rolling]` section behaves as `enabled = true`; a lone instance
+    /// self-detects and SIGTERM degrades to the plain drain. Opt out with
+    /// `[rolling] enabled = false`.
+    #[serde(default = "default_rolling_config")]
+    pub rolling: Option<RollingConfig>,
     /// Maximum size (in bytes) for audio files downloaded over HTTP from the
     /// console (queue prompts, voicemail prompts, ...). Defaults to 20 MB.
     #[serde(default = "default_max_audio_download_bytes")]
@@ -644,6 +809,29 @@ impl Default for ClusterConfig {
     }
 }
 
+/// The `[cluster].peers` entry that IS this node, matched by exact
+/// `addr:sip_port` against concrete (non-wildcard) listener addresses.
+pub fn match_self_peer_by_listeners<'a>(
+    peers: &'a [ClusterPeer],
+    local_addr_strs: &[String],
+) -> Option<&'a ClusterPeer> {
+    peers.iter().find(|p| {
+        let peer_sip_addr = format!("{}:{}", p.addr, p.sip_port);
+        local_addr_strs.iter().any(|la| la == &peer_sip_addr)
+    })
+}
+
+/// The `[cluster].peers` entry whose `addr` is one of the host's network
+/// interface IPs. Used when listeners are wildcard-bound (`0.0.0.0`/`::`) and
+/// report no concrete address, and at early startup before any listener
+/// exists (node-identity resolution — see `utils::init_instance_identity`).
+pub fn match_self_peer_by_interfaces<'a>(
+    peers: &'a [ClusterPeer],
+    interface_ips: &std::collections::HashSet<String>,
+) -> Option<&'a ClusterPeer> {
+    peers.iter().find(|p| interface_ips.contains(&p.addr))
+}
+
 fn default_session_registry_backend() -> String {
     "db".to_string()
 }
@@ -666,6 +854,10 @@ fn default_max_audio_download_bytes() -> u64 {
 
 fn default_stats_interval() -> u64 {
     5
+}
+
+fn default_cdr_rollup_interval() -> u64 {
+    300
 }
 
 fn default_locale() -> String {
@@ -791,13 +983,6 @@ impl LicenseConfig {
         })
     }
 
-    pub fn get_addons_for_key(&self, key_name: &str) -> Vec<&str> {
-        self.addons
-            .iter()
-            .filter(|(_, k)| k == &key_name)
-            .map(|(id, _)| id.as_str())
-            .collect()
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -839,6 +1024,64 @@ pub struct ConsoleConfig {
     /// account whose e-mail address they know.
     #[serde(default)]
     pub expose_reset_link_dev: bool,
+    /// Source-address ACL for the console, notably who may reach the
+    /// unauthenticated bootstrap that creates the first (superuser) account.
+    #[serde(default)]
+    pub acl: ConsoleAclConfig,
+}
+
+/// Source-address ACL for the console registration endpoints
+/// (`[console.acl]`).
+///
+/// The FIRST console account is created on the unauthenticated `/register`
+/// page and automatically becomes the superuser, so by default only loopback
+/// sources may bootstrap. `[console.acl] bootstrap` replaces that default
+/// with an explicit allow-list (it does not implicitly keep loopback).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ConsoleAclConfig {
+    /// Sources allowed to create the first (superuser) account. Supports
+    /// exact IPs, CIDR ranges, and "*" (any). Unset = loopback only.
+    #[serde(default)]
+    pub bootstrap: Option<Vec<String>>,
+    /// Optional restriction for the whole `/register` endpoint (bootstrap
+    /// and later self-registration alike). Unset = no extra restriction;
+    /// the registration policy still governs whether signup is open.
+    #[serde(default)]
+    pub registration: Option<Vec<String>>,
+}
+
+impl ConsoleAclConfig {
+    /// Entry match semantics mirror `AmiConfig::is_allowed`: exact address,
+    /// CIDR range, or the "*" wildcard.
+    fn entry_allows(entry: &str, ip: IpAddr) -> bool {
+        let entry = entry.trim();
+        entry == "*"
+            || entry
+                .parse::<IpAddr>()
+                .is_ok_and(|allowed| allowed == ip)
+            || entry
+                .parse::<IpNet>()
+                .is_ok_and(|network| network.contains(&ip))
+    }
+
+    /// May requests from `ip` create the first (superuser) account? An unset
+    /// list means the conservative default: loopback only.
+    pub fn bootstrap_allows(&self, ip: IpAddr) -> bool {
+        match &self.bootstrap {
+            None => ip.is_loopback(),
+            Some(entries) => entries.iter().any(|entry| Self::entry_allows(entry, ip)),
+        }
+    }
+
+    /// May requests from `ip` reach `/register` at all? An unset list adds no
+    /// address restriction (the registration policy still governs whether
+    /// signup is open); a configured list must match.
+    pub fn registration_allows(&self, ip: IpAddr) -> bool {
+        match &self.registration {
+            None => true,
+            Some(entries) => entries.iter().any(|entry| Self::entry_allows(entry, ip)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -866,6 +1109,7 @@ impl Default for ConsoleConfig {
             static_path: None,
             api_tokens: Vec::new(),
             expose_reset_link_dev: false,
+            acl: ConsoleAclConfig::default(),
         }
     }
 }
@@ -1298,6 +1542,18 @@ pub struct RtpConfig {
     /// periodic snapshots (stall events are still emitted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_trace_interval_secs: Option<u64>,
+    /// Sliding media diagnostics; disabled periodic logs preserve quiet defaults.
+    #[serde(default)]
+    pub quality_stats: crate::media::quality_stats::QualityStatsConfig,
+    #[serde(default)]
+    pub volume_stats: crate::media::volume_stats::VolumeStatsConfig,
+    /// In-band audio DTMF detection policy (`auto` | `on` | `off`, default
+    /// `auto`): `auto` runs the Goertzel detector on every leg that
+    /// negotiated NO `telephone-event` (old phones / PSTN), so IVR /
+    /// voicemail flows still receive key presses. Detected digits are tagged
+    /// `source=inband` on the RWI `dtmf` event.
+    #[serde(default)]
+    pub inband_dtmf: crate::media::inband_dtmf::InbandDtmfMode,
 }
 
 fn default_comfort_noise() -> bool {
@@ -1336,6 +1592,15 @@ pub struct MediaSection {
     /// periodic snapshots (stall events are still emitted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_trace_interval_secs: Option<u64>,
+    /// Sliding media diagnostics; disabled periodic logs preserve quiet defaults.
+    #[serde(default)]
+    pub quality_stats: crate::media::quality_stats::QualityStatsConfig,
+    #[serde(default)]
+    pub volume_stats: crate::media::volume_stats::VolumeStatsConfig,
+    /// In-band audio DTMF detection policy override (see
+    /// `RtpConfig::inband_dtmf`). Defaults to `auto`.
+    #[serde(default)]
+    pub inband_dtmf: crate::media::inband_dtmf::InbandDtmfMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1537,11 +1802,29 @@ pub struct ProxyConfig {
     pub useragent: Option<String>,
     #[serde(default = "default_callid_suffix")]
     pub callid_suffix: Option<String>,
+    /// Length (hex chars) of freshly generated global session ids.
+    /// 8..=32; the default 32 mirrors the legacy UUID v4 simple form.
+    #[serde(default = "default_session_id_length")]
+    pub session_id_length: usize,
+    /// Wire format of the outgoing SIP `Session-ID` header: `native` stamps
+    /// the internal id verbatim; `rfc7989` zero-pads it to 32 hex chars.
+    #[serde(default)]
+    pub session_id_header_mode: crate::call::session_id::SessionIdHeaderMode,
+    /// Reuse id-shaped incoming SIP Call-IDs as the session id. When false,
+    /// only `Session-ID` headers inherit and every originate gets a fresh id.
+    #[serde(default = "default_session_id_inherit_callid")]
+    pub session_id_inherit_callid: bool,
     pub t1_timer: Option<u64>,
     pub t1x64_timer: Option<u64>,
     pub ssl_private_key: Option<String>,
     pub ssl_certificate: Option<String>,
     pub tls_ca_certificates: Option<String>,
+    /// Idle timeout in seconds for stream (TCP/TLS/WS) connections: a
+    /// connection with no inbound traffic for this long is closed and retired
+    /// from the connection table, reclaiming half-open sockets whose peer
+    /// vanished without a FIN. `0` disables. Defaults to 300 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
     pub udp_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_ports: Option<Vec<u16>>,
@@ -1562,6 +1845,23 @@ pub struct ProxyConfig {
     pub max_concurrency: Option<usize>,
     pub registrar_expires: Option<u32>,
     pub max_registrar_expires: Option<u32>,
+    /// Upper bound (seconds) granted on SIP event-package subscriptions
+    /// (presence / MWI SUBSCRIBE). The granted value is echoed in the 200 OK
+    /// `Expires` header and the NOTIFY `Subscription-State` so clients that
+    /// only read the 200 OK schedule refreshes correctly. Default 3600.
+    #[serde(default)]
+    pub max_subscription_expires: Option<u32>,
+    /// Presence-state TTL sweep cadence (seconds): the background task that
+    /// flips PUBLISHed states whose `Expires` lapsed back to Offline
+    /// (subject to the registration-liveness guard). Default 60s; tests
+    /// shrink it to bound waits. Clamped to 3..=600.
+    #[serde(default)]
+    pub presence_sweep_secs: Option<u32>,
+    /// Locator REGISTER-expiry sweep cadence (seconds): reclaims bindings
+    /// whose REGISTER lapsed without a goodbye and emits
+    /// `LocatorEvent::Offline(expired)`. Default 15s. Clamped to 5..=300.
+    #[serde(default)]
+    pub locator_sweep_secs: Option<u32>,
     pub ensure_user: Option<bool>,
     #[serde(default = "default_user_backends")]
     pub user_backends: Vec<UserBackendConfig>,
@@ -1576,6 +1876,12 @@ pub struct ProxyConfig {
     /// declared but empty table disables the built-in failure audio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_profile: Option<crate::proxy::routing::RingbackAudio>,
+    /// Global AMD (answering machine / AI assistant) detection defaults
+    /// (`[proxy] amd`). Route hints and trunk `[trunks.<name>] amd` sections
+    /// overlay it per-field; `app_params` overlay last at answer time.
+    /// Disabled unless `enabled = true` somewhere in the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd: Option<crate::media::amd::AmdConfig>,
     pub audio_codecs: Option<Vec<String>>,
     #[serde(default)]
     pub frequency_limiter: Option<String>,
@@ -1682,6 +1988,18 @@ pub struct ProxyConfig {
     /// in-session hand-off; failures roll back atomically. Default: enabled.
     #[serde(default = "default_true")]
     pub inbound_refer_in_session: bool,
+    /// Generate the RFC 5806 `Diversion` header on forwarded calls (unconditional
+    /// user forwarding and call-forward-on-busy / no-answer), re-rendering any
+    /// diversion chain inherited from the inbound INVITE. Off by default —
+    /// interconnect peers only expect it when they support call forwarding
+    /// notification. Per-trunk `diversion_headers` overrides this.
+    #[serde(default)]
+    pub diversion_headers: bool,
+    /// Generate the RFC 7044 `History-Info` header on forwarded calls (and
+    /// advertise `Supported: histinfo`). Off by default. Per-trunk
+    /// `history_info` overrides this.
+    #[serde(default)]
+    pub history_info: bool,
     /// SIP conference factory URI. Disabled when unset.
     #[serde(default)]
     pub conference_factory_uri: Option<String>,
@@ -1749,6 +2067,21 @@ pub struct ProxyConfig {
     /// `[proxy.queues.<name>.hold].audio_file`; per-queue config wins.
     #[serde(default)]
     pub queue_hold_music: Option<String>,
+    /// Allow pre-connect queue transfer prompts, including queue and escalation overrides.
+    #[serde(default = "default_true")]
+    pub queue_transfer_prompt_enabled: bool,
+    /// Allow comfort announcements while waiting; failure prompts are unaffected.
+    #[serde(default = "default_true")]
+    pub queue_comfort_prompt_enabled: bool,
+    /// Allow busy failure announcements before executing the queue fallback.
+    #[serde(default = "default_true")]
+    pub queue_busy_prompt_enabled: bool,
+    /// Play the built-in local ringback after an agent leg returns 180 Ringing.
+    #[serde(default)]
+    pub queue_agent_ringback_enabled: bool,
+    /// Allow no-answer announcements before executing the queue fallback.
+    #[serde(default = "default_true")]
+    pub queue_no_answer_prompt_enabled: bool,
     /// PBX-wide voicemail greeting (`[proxy] voicemail_greeting`). Used when
     /// the dialplan app params carry no `greeting_path` of their own;
     /// overrides the built-in `sounds/voicemail/greeting.wav`.
@@ -1925,6 +2258,14 @@ pub struct DialplanHints {
     /// console `metadata.sbc.ice_lite`). `Some(true)` forces `a=ice-lite` on
     /// this session's plain-RTP legs; `Some(false)` explicitly disables it.
     pub ice_lite: Option<bool>,
+    /// Custom SDP attribute pass-through gate (from
+    /// `[proxy.trunks.<name>] passthrough_custom_sdp_attrs` or the console
+    /// `metadata.sbc.passthrough_custom_sdp_attrs`). `None`/`true` keeps
+    /// vendor-specific `a=` lines flowing across the B2BUA rewrite in both
+    /// directions; `false` strips them. Source and destination trunks merge
+    /// with AND semantics (`Some(false)` always wins), so a single disabled
+    /// trunk disables pass-through for the whole call.
+    pub passthrough_custom_sdp_attrs: Option<bool>,
     /// Resolved network profile id stamped during routing (from trunk.profile).
     pub network_profile_id: Option<String>,
     /// Per-trunk ringback/early-media audio configuration
@@ -1932,6 +2273,14 @@ pub struct DialplanHints {
     /// Busy-wait (camp-on) policy from a forward route's `[busy_wait]` table.
     /// Applied by the call session when the callee rejects with 486 Busy.
     pub busy_wait: Option<crate::proxy::routing::RouteBusyWaitConfig>,
+    /// Resolved diversion-header policy (per-trunk overrides over globals),
+    /// stamped during routing. `None` when no trunk/route policy applies —
+    /// the session then falls back to the global proxy config.
+    pub diversion_policy: Option<crate::proxy::routing::DiversionPolicy>,
+    /// AMD (answering machine / AI assistant) detection config: route-level
+    /// setting over the trunk's `[trunks.<name>] amd` section. `None` → the
+    /// session falls back to the global `[proxy] amd`.
+    pub amd: Option<crate::media::amd::AmdConfig>,
     /// Concurrency slots acquired during routing policy enforcement. The
     /// session releases them on hangup to avoid leaking the concurrency budget.
     pub concurrency_holds: Vec<crate::call::policy::ConcurrencyHold>,
@@ -1955,14 +2304,39 @@ impl std::fmt::Debug for DialplanHints {
             .field("external_ip", &self.external_ip)
             .field("bind_ip", &self.bind_ip)
             .field("ice_lite", &self.ice_lite)
+            .field(
+                "passthrough_custom_sdp_attrs",
+                &self.passthrough_custom_sdp_attrs,
+            )
             .field("busy_wait", &self.busy_wait)
+            .field("diversion_policy", &self.diversion_policy)
+            .field("amd", &self.amd)
             .finish()
+    }
+}
+
+/// One routed destination: the INVITE to send (callee, rewritten caller,
+/// destination, credential, headers), its dialplan hints, and when a failure
+/// on it may advance to the next target.
+pub struct RouteTarget {
+    pub option: InviteOption,
+    pub hints: Option<DialplanHints>,
+    /// None never advances to the next target.
+    pub retry_policy: Option<crate::proxy::routing::RetryPolicy>,
+}
+
+impl RouteTarget {
+    pub fn new(option: InviteOption, hints: Option<DialplanHints>) -> Self {
+        Self { option, hints, retry_policy: None }
     }
 }
 
 #[allow(clippy::large_enum_variant)]
 pub enum RouteResult {
-    Forward(InviteOption, Option<DialplanHints>),
+    /// Ordered targets. A single target dials exactly as before; later targets
+    /// are tried only when the failed target's retry policy allows it.
+    /// An empty list has no destination and must not fall back to direct dialing.
+    Forward(Vec<RouteTarget>),
     Queue {
         option: InviteOption,
         queue: QueuePlan,
@@ -2010,7 +2384,10 @@ impl Default for GracefulShutdownConfig {
 }
 
 fn default_graceful_shutdown_drain_timeout() -> u64 {
-    300
+    // Aligned with max_call_duration (3600s): a rolling-handover drain must
+    // never force-kill a call that would have ended naturally. Ops note:
+    // `docker stop -t` must exceed this value or SIGKILL defeats the drain.
+    3600
 }
 
 impl GracefulShutdownConfig {
@@ -2019,6 +2396,93 @@ impl GracefulShutdownConfig {
     pub fn effective_timeout(&self) -> Option<std::time::Duration> {
         (self.drain_timeout_secs > 0)
             .then(|| std::time::Duration::from_secs(self.drain_timeout_secs))
+    }
+}
+
+/// `[rolling]` — rolling process handover for container deployments.
+///
+/// The successor (new release) container starts first and waits for the
+/// public ports; `docker stop` on the predecessor triggers a handover
+/// instead of a plain drain: the predecessor keeps serving its live calls
+/// while the successor takes over every public listener, and in-dialog SIP
+/// destined to the predecessor's calls is relayed over loopback HTTP until
+/// the drain completes. Protocol lives in [`crate::rolling`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RollingConfig {
+    #[serde(default = "default_rolling_enabled")]
+    pub enabled: bool,
+    /// Loopback-only listener the PREDECESSOR serves during the handover
+    /// window (`/rolling/relay_ingress`, `/rolling/manifest`, plus the full
+    /// management router for AMI forwards). Host-network deployments must
+    /// pick a port that no other node uses. Default 18181.
+    #[serde(default = "default_rolling_predecessor_port")]
+    pub predecessor_port: u16,
+    /// How long the successor keeps retrying the final port binds after the
+    /// predecessor announces the handover. The idle wait BEFORE that
+    /// ("new container up" → "docker stop old") is unbounded — the
+    /// successor hello-pings while it waits. Default 60s.
+    #[serde(default = "default_rolling_bind_wait_secs")]
+    pub bind_wait_secs: u64,
+    /// Push the predecessor's registration table to the successor at
+    /// handover. Only meaningful for memory-locator deployments (DB-backed
+    /// locators already share registrations). Default false.
+    #[serde(default)]
+    pub handoff_registrations: bool,
+    /// Successor → predecessor hello heartbeat interval in seconds. The
+    /// predecessor only accepts a handover when a heartbeat arrived within
+    /// 3× this window. Default 2s.
+    #[serde(default = "default_rolling_hello_interval_secs")]
+    pub hello_interval_secs: u64,
+}
+
+/// Rolling handover is ENABLED by default: a lone instance self-detects (its
+/// own hello comes back with its own pid) and SIGTERM degrades to the plain
+/// drain — identical behavior to a non-rolling deployment. A rolling pair
+/// (successor started first, then `docker stop` on the predecessor) gets
+/// the zero-restart handover. Opt out with `[rolling] enabled = false`.
+fn default_rolling_enabled() -> bool {
+    true
+}
+
+/// Absent `[rolling]` section = enabled (see [`default_rolling_enabled`]).
+fn default_rolling_config() -> Option<RollingConfig> {
+    Some(RollingConfig::default())
+}
+
+fn default_rolling_predecessor_port() -> u16 {
+    18181
+}
+
+fn default_rolling_bind_wait_secs() -> u64 {
+    60
+}
+
+fn default_rolling_hello_interval_secs() -> u64 {
+    2
+}
+
+impl Default for RollingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rolling_enabled(),
+            predecessor_port: default_rolling_predecessor_port(),
+            bind_wait_secs: default_rolling_bind_wait_secs(),
+            handoff_registrations: false,
+            hello_interval_secs: default_rolling_hello_interval_secs(),
+        }
+    }
+}
+
+impl RollingConfig {
+    /// A successor heartbeat older than this is treated as absent.
+    pub fn hello_fresh_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.hello_interval_secs * 3)
+    }
+
+    /// How long the successor keeps trusting the predecessor's manifest
+    /// (call-id set) after the last refresh.
+    pub fn manifest_fresh_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(10)
     }
 }
 
@@ -2127,6 +2591,26 @@ impl AmiConfig {
 }
 
 impl ProxyConfig {
+    /// Presence TTL sweep cadence, clamped to a safe range (a too-tight
+    /// loop would spin the locator liveness queries; a too-loose one makes
+    /// stale publications linger).
+    pub fn clamped_presence_sweep_secs(&self) -> u32 {
+        self.presence_sweep_secs.unwrap_or(60).clamp(3, 600)
+    }
+
+    /// Locator expiry sweep cadence, clamped (the sweep also feeds the
+    /// offline reason pipeline — sub-second loops would flood it).
+    pub fn clamped_locator_sweep_secs(&self) -> u32 {
+        self.locator_sweep_secs.unwrap_or(15).clamp(5, 300)
+    }
+
+    /// Subscription expiry ceiling (seconds) for presence/MWI SUBSCRIBE,
+    /// floored so a typo'd near-zero value cannot thrash clients with
+    /// immediate refresh loops.
+    pub fn clamped_max_subscription_expires(&self) -> u32 {
+        self.max_subscription_expires.unwrap_or(3600).max(60)
+    }
+
     pub fn session_timer_mode(&self) -> SessionTimerMode {
         if !self.session_timer {
             SessionTimerMode::Off
@@ -2268,11 +2752,17 @@ impl ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            amd: None,
+            presence_sweep_secs: None,
+            locator_sweep_secs: None,
             acl_rules: Some(vec!["allow all".to_string(), "deny all".to_string()]),
             ua_white_list: Some(vec![]),
             ua_black_list: Some(vec![]),
             ua_block_scanners: default_ua_block_scanners(),
             addr: "0.0.0.0".to_string(),
+            session_id_length: default_session_id_length(),
+            session_id_header_mode: Default::default(),
+            session_id_inherit_callid: default_session_id_inherit_callid(),
             modules: Some(vec![
                 "acl".to_string(),
                 "auth".to_string(),
@@ -2287,6 +2777,7 @@ impl Default for ProxyConfig {
             ssl_private_key: None,
             ssl_certificate: None,
             tls_ca_certificates: None,
+            stream_idle_timeout: None,
             udp_port: Some(5060),
             udp_ports: None,
             tcp_port: None,
@@ -2295,6 +2786,7 @@ impl Default for ProxyConfig {
             max_concurrency: None,
             registrar_expires: Some(30),
             max_registrar_expires: Some(50),
+            max_subscription_expires: Some(3600),
             ensure_user: Some(true),
             enable_latching: true,
             latching_probation_max_packets: default_latching_probation_max_packets(),
@@ -2340,6 +2832,8 @@ impl Default for ProxyConfig {
             dialog_auth_cache: default_dialog_auth_cache(),
             blind_transfer_use_refer: false,
             inbound_refer_in_session: true,
+            diversion_headers: false,
+            history_info: false,
             conference_factory_uri: None,
             conference_empty_timeout_secs: default_conference_empty_timeout_secs(),
             route_originated_calls: false,
@@ -2359,6 +2853,11 @@ impl Default for ProxyConfig {
             jwt_auth: None,
             hold_music: None,
             queue_hold_music: None,
+            queue_transfer_prompt_enabled: true,
+            queue_comfort_prompt_enabled: true,
+            queue_busy_prompt_enabled: true,
+            queue_agent_ringback_enabled: false,
+            queue_no_answer_prompt_enabled: true,
             voicemail_greeting: None,
             sip_worker_threads: default_sip_worker_threads(),
             media_worker_threads: default_media_worker_threads(),
@@ -2403,6 +2902,7 @@ impl Default for Config {
             log_file: None,
             stats_log: None,
             stats_interval: default_stats_interval(),
+            cdr_rollup_interval: default_cdr_rollup_interval(),
             log_rotation: String::new(),
             http_access_skip_paths: Vec::new(),
             proxy: ProxyConfig::default(),
@@ -2411,6 +2911,7 @@ impl Default for Config {
             media: None,
             ami: Some(AmiConfig::default()),
             graceful_shutdown: None,
+            rolling: Some(RollingConfig::default()),
             external_ip: None,
             auto_external_ip: None,
             sip_external_ip: None,
@@ -2431,6 +2932,7 @@ impl Default for Config {
             database_pool: DatabasePoolConfig::default(),
             recording: None,
             demo_mode: false,
+            instance_id: None,
             storage: None,
             sipflow: None,
             licenses: None,
@@ -2471,12 +2973,6 @@ impl Config {
         let mut config: Self = toml::from_str(
             &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
         )?;
-        if std::env::var("RUSTPBX_DEMO_MODE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-        {
-            config.demo_mode = true;
-        }
         config.ensure_recording_defaults();
         Ok(config)
     }
@@ -2486,12 +2982,6 @@ impl Config {
             .await
             .map_err(|e| anyhow::anyhow!("{}: {}", e, path))?;
         let mut config: Self = toml::from_str(&contents)?;
-        if std::env::var("RUSTPBX_DEMO_MODE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-        {
-            config.demo_mode = true;
-        }
         config.ensure_recording_defaults();
         Ok(config)
     }
@@ -2525,6 +3015,13 @@ impl Config {
             relay_ready_timeout_secs: media.and_then(|m| m.relay_ready_timeout_secs),
             stall_detect_secs: media.and_then(|m| m.stall_detect_secs),
             media_trace_interval_secs: media.and_then(|m| m.media_trace_interval_secs),
+            quality_stats: media.map(|m| m.quality_stats.clone()).unwrap_or_default(),
+            volume_stats: media.map(|m| m.volume_stats.clone()).unwrap_or_default(),
+            // The media section may override the platform default; absent →
+            // `auto` (serde default of `InbandDtmfMode`).
+            inband_dtmf: media
+                .map(|m| m.inband_dtmf)
+                .unwrap_or_default(),
         }
     }
 
@@ -2532,52 +3029,7 @@ impl Config {
     /// Static entries are preserved; shared-secret TURN credentials are minted
     /// per request and are not cached in the server-side RTP configuration.
     pub fn browser_ice_servers(&self, now: u64) -> Result<Vec<IceServer>> {
-        let mut servers = Vec::new();
-        for entry in self.ice_servers.iter().flatten() {
-            let Some(secret) = &entry.secrete else {
-                servers.push(entry.server.clone());
-                continue;
-            };
-            use base64::{Engine as _, engine::general_purpose::STANDARD};
-            use hmac::{Hmac, KeyInit, Mac};
-
-            let turn = &entry.server;
-            let user = turn.username.as_deref().unwrap_or("rustpbx");
-            let lifetime = entry.lifetime.unwrap_or(3600);
-            anyhow::ensure!(!secret.is_empty(), "ice_servers.secrete must not be empty");
-            anyhow::ensure!(
-                turn.credential.is_none(),
-                "ice_servers cannot combine secrete and credential"
-            );
-            anyhow::ensure!(
-                turn.credential_type == rustrtc::IceCredentialType::Password,
-                "ice_servers.secrete requires password credentials"
-            );
-            anyhow::ensure!(
-                !turn.urls.is_empty()
-                    && turn.urls.iter().all(|url| {
-                        url.strip_prefix("turn:")
-                            .or_else(|| url.strip_prefix("turns:"))
-                            .is_some_and(|host| !host.is_empty())
-                    }),
-                "ice_servers with secrete must contain TURN URLs"
-            );
-            anyhow::ensure!(
-                !user.is_empty() && !user.contains(':'),
-                "ice_servers with secrete require a nonempty username suffix without a colon"
-            );
-            anyhow::ensure!(lifetime > 0, "ice_servers.lifetime must be positive");
-            let expires = now
-                .checked_add(lifetime)
-                .ok_or_else(|| anyhow::anyhow!("ice_servers.lifetime overflows expiry"))?;
-            let username = format!("{}:{}", expires, user);
-            let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes())?;
-            mac.update(username.as_bytes());
-            // TURN REST passwords use standard padded Base64, as in coturn.
-            let credential = STANDARD.encode(mac.finalize().into_bytes());
-            servers.push(turn.clone().with_credential(username, credential));
-        }
-        Ok(servers)
+        mint_ice_servers(self.ice_servers.as_deref().unwrap_or(&[]), now)
     }
 
     pub fn sip_contact_config(&self) -> SipContactConfig {
@@ -2646,19 +3098,6 @@ impl Config {
         None
     }
 
-    pub fn resolve_trunk_network_profile(
-        &self,
-        trunk: &crate::proxy::routing::TrunkConfig,
-    ) -> NetworkProfile {
-        if let Some(ref id) = trunk.profile {
-            if let Some(profile) = self.network_profile(id) {
-                return profile;
-            }
-        }
-        self.network_profile(&self.default_network_profile_id())
-            .unwrap_or_else(|| self.synthetic_default_network_profile())
-    }
-
     pub fn recorder_path(&self) -> String {
         self.recording
             .as_ref()
@@ -2707,6 +3146,77 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_acl_bootstrap_defaults_to_loopback_only() {
+        let acl = ConsoleAclConfig::default();
+        assert!(acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(acl.bootstrap_allows("::1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        // Missing ConnectInfo leaves the 0.0.0.0 placeholder, which must not
+        // pass the loopback default (fail-closed).
+        assert!(!acl.bootstrap_allows("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn console_acl_bootstrap_explicit_list_is_authoritative() {
+        let acl = ConsoleAclConfig {
+            bootstrap: Some(vec!["192.168.1.0/24".into(), "10.0.0.5".into()]),
+            registration: None,
+        };
+        assert!(acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        assert!(acl.bootstrap_allows("10.0.0.5".parse().unwrap()));
+        // An explicit list replaces the implicit loopback allowance.
+        assert!(!acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("192.168.2.10".parse().unwrap()));
+
+        let any = ConsoleAclConfig {
+            bootstrap: Some(vec!["*".into()]),
+            registration: None,
+        };
+        assert!(any.bootstrap_allows("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn console_acl_registration_unset_adds_no_restriction() {
+        let acl = ConsoleAclConfig::default();
+        assert!(acl.registration_allows("203.0.113.9".parse().unwrap()));
+
+        let gated = ConsoleAclConfig {
+            bootstrap: None,
+            registration: Some(vec!["10.0.0.0/8".into()]),
+        };
+        assert!(gated.registration_allows("10.1.2.3".parse().unwrap()));
+        assert!(!gated.registration_allows("192.168.1.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn console_acl_parses_from_toml() {
+        let raw = r#"
+[console]
+base_path = "/console"
+
+[console.acl]
+bootstrap = ["192.168.1.0/24", "::1"]
+registration = ["10.0.0.0/8"]
+"#;
+        let doc: toml::Value = toml::from_str(raw).expect("parse config");
+        let console: ConsoleConfig = doc["console"].clone().try_into().expect("console section");
+        let acl = console.acl;
+        assert!(acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        assert!(acl.bootstrap_allows("::1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("10.9.9.9".parse().unwrap()));
+        assert!(acl.registration_allows("10.9.9.9".parse().unwrap()));
+        assert!(!acl.registration_allows("192.168.1.10".parse().unwrap()));
+
+        // Without an [console.acl] section the bootstrap default stays
+        // loopback-only and registration is unrestricted.
+        let bare: ConsoleConfig = toml::from_str("").expect("parse empty console");
+        assert!(bare.acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(!bare.acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        assert!(bare.acl.registration_allows("192.168.1.10".parse().unwrap()));
+    }
 
     #[test]
     fn recording_policy_parses_sources_and_record_ringing() {
@@ -2972,6 +3482,53 @@ bucket = "default-recordings"
     }
 
     #[test]
+    fn test_turn_rest_hex_encoding_matches_miuturn_short_term() {
+        let settings = |encoding: &str| {
+            format!(
+                r#"
+                urls = ["turn:turn.example.com:3478"]
+                secrete = "interop-secret"
+                username = "rustpbx"
+                lifetime = 3600
+                encoding = "{encoding}"
+                "#
+            )
+        };
+        // miuturn's ShortTermCredentialManager verifies lowercase-hex
+        // HMAC-SHA1 passwords over the same digest that coturn-style Base64
+        // entries carry (see test_turn_rest_ice_servers_match_miuturn).
+        let hex_entry: IceServerConfig = toml::from_str(&settings("hex")).unwrap();
+        let servers = mint_ice_servers(&[hex_entry.clone()], 4_102_441_200).unwrap();
+        assert_eq!(servers[0].username.as_deref(), Some("4102444800:rustpbx"));
+        assert_eq!(
+            servers[0].credential.as_deref(),
+            Some("f9d388a7b9fd0c7cc84fcb8d7d5cfcb4d159a0bb")
+        );
+        // Explicit Base64 stays equivalent to the no-encoding default.
+        let base64_entry: IceServerConfig = toml::from_str(&settings("base64")).unwrap();
+        let default_entry = IceServerConfig {
+            encoding: None,
+            ..hex_entry.clone()
+        };
+        assert_eq!(
+            mint_ice_servers(&[base64_entry], 4_102_441_200).unwrap(),
+            mint_ice_servers(&[default_entry], 4_102_441_200).unwrap()
+        );
+        // The encoding survives a config roundtrip.
+        let config = Config {
+            ice_servers: Some(vec![hex_entry]),
+            ..Config::default()
+        };
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("encoding = \"hex\""));
+        let restored: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            restored.browser_ice_servers(4_102_441_200).unwrap(),
+            config.browser_ice_servers(4_102_441_200).unwrap()
+        );
+    }
+
+    #[test]
     fn test_video_codecs_default_and_override() {
         let default_config: ProxyConfig = toml::from_str("addr = \"::\"").unwrap();
         assert_eq!(default_config.video_codecs, vec!["H264", "VP8"]);
@@ -3145,6 +3702,11 @@ bucket = "default-recordings"
             addr = "0.0.0.0"
             hold_music = "sounds/hold.wav"
             queue_hold_music = "sounds/moh/kzmusic.wav"
+            queue_transfer_prompt_enabled = false
+            queue_comfort_prompt_enabled = false
+            queue_busy_prompt_enabled = false
+            queue_agent_ringback_enabled = true
+            queue_no_answer_prompt_enabled = false
             voicemail_greeting = "sounds/voicemail/custom.wav"
         "#;
         let config: Config = toml::from_str(toml_str).expect("config should parse");
@@ -3157,6 +3719,11 @@ bucket = "default-recordings"
             Some("sounds/voicemail/custom.wav")
         );
         assert_eq!(config.proxy.hold_music.as_deref(), Some("sounds/hold.wav"));
+        assert!(!config.proxy.queue_transfer_prompt_enabled);
+        assert!(!config.proxy.queue_comfort_prompt_enabled);
+        assert!(!config.proxy.queue_busy_prompt_enabled);
+        assert!(config.proxy.queue_agent_ringback_enabled);
+        assert!(!config.proxy.queue_no_answer_prompt_enabled);
 
         // Unset keys stay None — old configs keep working unchanged.
         let empty: Config =
@@ -3164,6 +3731,11 @@ bucket = "default-recordings"
         assert!(empty.proxy.queue_hold_music.is_none());
         assert!(empty.proxy.voicemail_greeting.is_none());
         assert!(empty.proxy.hold_music.is_none());
+        assert!(empty.proxy.queue_transfer_prompt_enabled);
+        assert!(empty.proxy.queue_comfort_prompt_enabled);
+        assert!(empty.proxy.queue_busy_prompt_enabled);
+        assert!(!empty.proxy.queue_agent_ringback_enabled);
+        assert!(empty.proxy.queue_no_answer_prompt_enabled);
     }
 
     #[test]
@@ -3333,10 +3905,9 @@ bucket = "default-recordings"
 
     #[test]
     fn test_recording_http_upload_defaults_preserve_wire_format() {
-        let policy: RecordingPolicy = toml::from_str(
-            "enabled = true\ntype = \"http\"\nurl = \"http://host/recording\"\n",
-        )
-        .expect("recording policy should parse");
+        let policy: RecordingPolicy =
+            toml::from_str("enabled = true\ntype = \"http\"\nurl = \"http://host/recording\"\n")
+                .expect("recording policy should parse");
         let http = policy.http_upload_config().expect("http upload config");
         assert_eq!(http.file_field.as_deref(), Some("recording"));
         assert_eq!(http.content_type.as_deref(), Some("audio/wav"));
@@ -3442,16 +4013,48 @@ bucket = "default-recordings"
     fn test_media_ice_lite_flows_into_rtp_config() {
         let config: Config = toml::from_str(r#"proxy = { addr = "127.0.0.1" }"#).unwrap();
         assert!(!config.rtp_config().ice_lite, "default must stay off");
+        assert!(!config.rtp_config().quality_stats.enabled);
 
         let config: Config = toml::from_str(
             r#"
             proxy = { addr = "127.0.0.1" }
             [media]
             ice_lite = true
+            [media.volume_stats]
+            enabled = true
+            [media.quality_stats]
+            enabled = true
+            sample_interval_ms = 500
+            window_ms = 2000
+            log_interval_ms = 2000
         "#,
         )
         .unwrap();
         assert!(config.rtp_config().ice_lite);
+        assert!(config.rtp_config().quality_stats.enabled);
+        assert!(config.rtp_config().volume_stats.enabled);
+        assert_eq!(config.rtp_config().quality_stats.sample_interval_ms, 500);
+        assert!(
+            toml::from_str::<Config>(
+                r#"proxy={addr="127.0.0.1"}
+            [media.quality_stats]
+            sample_interval_ms=1
+        "#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_cdr_rollup_interval_parsing() {
+        let config: Config = toml::from_str(r#"proxy={addr="127.0.0.1"}"#).unwrap();
+        assert_eq!(config.cdr_rollup_interval, 300);
+        let config: Config = toml::from_str(
+            r#"cdr_rollup_interval = 0
+            proxy={addr="127.0.0.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.cdr_rollup_interval, 0);
     }
 
     /// Trunk-level override parsing: `ice_lite` is optional per trunk and
@@ -3620,6 +4223,45 @@ bucket = "default-recordings"
         assert_eq!(parsed.peers.len(), 2);
         assert_eq!(parsed.peers[0].addr, "10.0.0.2");
         assert_eq!(parsed.peers[1].addr, "10.0.0.3");
+    }
+
+    #[test]
+    fn test_match_self_peer_by_listeners() {
+        let peers = vec![
+            ClusterPeer {
+                addr: "10.0.0.2".to_string(),
+                sip_port: 5060,
+                ami_port: 8080,
+            },
+            ClusterPeer {
+                addr: "10.0.0.3".to_string(),
+                sip_port: 5061,
+                ami_port: 8081,
+            },
+        ];
+        let listeners = vec!["10.0.0.3:5061".to_string()];
+        assert_eq!(
+            match_self_peer_by_listeners(&peers, &listeners).map(|p| p.addr.as_str()),
+            Some("10.0.0.3")
+        );
+        assert!(match_self_peer_by_listeners(&peers, &[]).is_none());
+    }
+
+    #[test]
+    fn test_match_self_peer_by_interfaces() {
+        let peers = vec![ClusterPeer {
+            addr: "10.0.0.2".to_string(),
+            sip_port: 5060,
+            ami_port: 8080,
+        }];
+        let ips: std::collections::HashSet<String> =
+            ["10.0.0.2".to_string(), "127.0.0.1".to_string()].into();
+        assert_eq!(
+            match_self_peer_by_interfaces(&peers, &ips).map(|p| p.addr.as_str()),
+            Some("10.0.0.2")
+        );
+        let empty: std::collections::HashSet<String> = Default::default();
+        assert!(match_self_peer_by_interfaces(&peers, &empty).is_none());
     }
 
     #[cfg(feature = "commerce")]

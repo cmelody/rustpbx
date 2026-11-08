@@ -51,6 +51,7 @@ RustPBX 通过两种方式与外部系统交互：
   "from": "<sip:1001@pbx.com>",
   "to": "<sip:200@pbx.com>",
   "source_addr": "1.2.3.4:5060",
+  "source_trunk": "carrier-a",  // 呼入所经的中继；非中继呼入时为 null
   "direction": "inbound",  // inbound | outbound | internal
   "method": "INVITE",
   "uri": "sip:200@pbx.com",
@@ -83,6 +84,66 @@ RustPBX 通过两种方式与外部系统交互：
 ```
 
 `record_start_at` 为本通通话覆盖 `[recording].auto_start_at`。省略时继承全局值；两者均未设置时默认为 `media`。也可以只返回此字段而不返回 `record`，在保留全局录音启用策略的同时覆盖开始时机。
+
+**顺序重试与 RTP 网卡选择**：
+
+```json
+{
+  "action": "forward",
+  "strategy": "sequential",
+  "targets": [
+    {"uri": "sip:1001@192.0.2.10:5060", "retry_policy": {"status_codes": [408, 503]}},
+    {"uri": "sip:1001@192.0.2.11:5060", "retry_policy": {"status_codes": []}}
+  ],
+  "media_proxy": "all",
+  "rtp_config": {"bind_ip": "10.0.0.10", "external_ip": "203.0.113.10"}
+}
+```
+
+`targets` 可以混用 SIP URI 字符串和包含 `uri`、可选 `retry_policy` 的对象。
+重试策略仅在目标级配置；当前目标失败时，只有状态码在其 `status_codes`
+列表内才尝试下一个目标。状态码范围为 300–699，空列表禁止继续重试。
+字符串目标或未设置策略的对象保留原有行为：失败后继续下一个目标。每个目标只尝试一次，
+不会重新请求 HTTP 路由服务。接听或主叫取消后停止；`parallel` 并行呼叫不使用重试策略。
+`max_ring_time` 限制整个呼叫建立阶段，`timeout` 限制通话时长。
+
+`rtp_config.bind_ip` 指定本机 RTP/SRTP socket 绑定地址，必须是 PBX 主机上的 IP；
+`external_ip` 指定 SDP 宣告地址。两者支持 IPv4/IPv6 字面量，省略或 null 继承服务器配置。
+这些设置作用于整个呼叫，重试时保持不变。需要媒体经过指定网卡时使用
+`media_proxy: "all"`；直连或 bypass 不会绑定代理 RTP socket。
+WebRTC 仍然通过 ICE 跨网卡收集候选地址，不受此固定绑定地址限制。
+此对象仅开放上述两个字段，其余 RTC 设置仍采用现有服务器默认值。
+无效 IP、未知 `rtp_config` 字段或无效重试状态码会导致 SIP 500 路由错误。
+无效目标 URI 继续按原有行为跳过。
+
+**中继目标**：目标可以直接指定已配置的中继名称，其余配置均取自该中继：
+
+```json
+{
+  "action": "forward",
+  "strategy": "sequential",
+  "targets": [
+    {"trunk": "carrier-a"},
+    {"trunk": "carrier-b", "callee": "8613800000000"},
+    {"trunk": "carrier-c", "retry_policy": {"status_codes": [503]}}
+  ]
+}
+```
+
+- `trunk`（必填）：中继名称。中继不存在或已禁用时，呼叫以 SIP 500 失败。
+- `callee`（可选）：被叫号码，默认为原被叫用户；纯用户名会补全为中继目的地址的主机。
+- `retry_policy`（可选）：覆盖中继自身的[重试策略](trunk-retry.md)。两者都没有时，
+  该目标失败后不再继续，与其他路由到中继的目标一致。
+
+中继按静态路由规则的方式生效：目的地址与传输协议、认证信息、主机改写、编解码、
+网络配置与媒体 IP、`max_ring_time` 以及话单中的中继归属。顺序呼叫中每个中继的
+`max_ring_time` 只限制自己的这次尝试；只有一个中继目标且响应未设置 `max_ring_time`
+时，它限制整个呼叫。响应中的 `caller` 和 `headers` 同样作用于中继目标。
+同一目标不能同时包含 `uri` 和 `trunk`。并行呼叫只使用中继的目的地址和认证信息。
+
+对于经中继呼入的呼叫（`source_trunk`），该中继的网络路径（网络配置、媒体 IP、ICE-lite）
+与静态路由一样作用于每个顺序目标；中继目标自身的设置优先，响应中的 `rtp_config`
+地址又优先于两者。`rtp_config` 未设置的部分（RTP 端口范围、SIP Contact 地址）仍由网络配置提供。
 
 ### 1.2 用户后端（SIP 认证）
 
@@ -137,7 +198,7 @@ RustPBX 通过两种方式与外部系统交互：
 ```json
 {
   "event": "registered",
-  "timestamp": 1708201234,
+  "timestamp": "2026-02-18T00:20:34+08:00",
   "location": {
     "aor": "sip:1001@1.2.3.4:12345",
     "home_proxy": "10.0.0.12:5060",
@@ -155,7 +216,7 @@ RustPBX 通过两种方式与外部系统交互：
 | 字段 | 含义 |
 | --- | --- |
 | `event` | `registered`、`unregistered` 或 `offline` |
-| `timestamp` | RustPBX 构造 Webhook 载荷时的 UNIX 时间戳，单位为秒 |
+| `timestamp` | RFC 3339 时间戳，RustPBX 构造 Webhook 载荷时的**服务器本地时区**（如 `+08:00`；宿主未设 `TZ` 时为 `+00:00`） |
 | `aor` | 来自 REGISTER 的 `Contact` 头的设备 Contact URI；它不一定是用户的规范身份 |
 | `home_proxy` | 接受并持有该注册的 RustPBX 节点所公布的 SIP 地址 |
 | `destination` | RustPBX 观察到的设备网络地址，包括可用的传输协议信息 |
@@ -171,7 +232,7 @@ Locator Webhook 不包含 REGISTER 的 Request-URI。在直接连接的单节点
 ```json
 {
   "event": "offline",
-  "timestamp": 1708201294,
+  "timestamp": "2026-02-18T00:21:34+08:00",
   "locations": [
     {
       "aor": "sip:1001@1.2.3.4:12345",
@@ -373,7 +434,7 @@ GET /ami/v1/sipflow/media/abc123?start=1713232800&end=1713234600
 
 ### 场景 D：合规录音
 
-`[recording].enabled` 启用媒体采集。`[recording].type` 选择媒体去向：`local` / `http` / `s3` 写入 WAV（由 `[recording]` 上传）；`sipflow` 将 RTP 写入 `[sipflow]` 后端（由 `[sipflow.upload].media` 上传）。只要配置了 `[sipflow]` 就会采集 SIP 信令。`auto_start_at = "media"`（默认值）在第一次完成主叫媒体设置后安装录音器；使用 `"answer"` 则等待最终的 200 响应。
+`[recording].enabled` 启用媒体采集。`[recording].type` 选择媒体去向：`local` / `http` / `s3` 写入 WAV（由 `[recording]` 上传）；`sipflow` 将 RTP 写入 `[sipflow]` 后端（由 `[sipflow.upload].media` 上传）。只要配置了 `[sipflow]` 就会采集 SIP 信令。`auto_start_at = "media"`（默认值）在第一次完成主叫媒体设置后安装录音器；使用 `"answer"` 则等待最终的 200 响应。`discard_unanswered = true` 会删除未接通通话（仅有早期媒体）的 WAV 录音，不保留也不上传；不影响 SipFlow 采集。
 
 #### 方案 1：完整 SipFlow（RTP + SIP）
 

@@ -44,11 +44,59 @@ impl ConfigOrigin {
     }
 }
 
+/// When a failed sequential target may advance to the next target. A target
+/// that rings past its trunk's `max_ring_time` fails with 408.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Final SIP failure responses that allow another target. Empty disables retry.
+    #[serde(default)]
+    pub status_codes: Vec<u16>,
+}
+
+impl RetryPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if self.status_codes.iter().any(|code| !(300..=699).contains(code)) {
+            return Err(anyhow!("retry status codes must be final SIP failure codes (300–699)"));
+        }
+        Ok(())
+    }
+}
+
+/// Resolved diversion-header rendering policy for an outgoing target:
+/// per-trunk overrides merged over the global defaults. Carried on
+/// [`DialplanHints`] so the session applies it when building the outgoing
+/// INVITE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DiversionPolicy {
+    /// Render the RFC 5806 `Diversion` header.
+    pub diversion_headers: bool,
+    /// Render the RFC 7044 `History-Info` header.
+    pub history_info: bool,
+}
+
+impl DiversionPolicy {
+    /// Globals with per-trunk overrides applied on top.
+    pub fn resolve(global_diversion: bool, global_history: bool, override_: Option<Self>) -> Self {
+        match override_ {
+            Some(policy) => policy,
+            None => Self {
+                diversion_headers: global_diversion,
+                history_info: global_history,
+            },
+        }
+    }
+}
+
 /// Single trunk configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TrunkConfig {
     pub dest: String,
     pub backup_dest: Option<String>,
+    /// Outbound proxy (`host[:port]` or SIP URI) that trunk REGISTERs are
+    /// sent through; `dest` stays the registrar in Request-URI/From/To and
+    /// is not resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_proxy: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     #[serde(
@@ -82,6 +130,10 @@ pub struct TrunkConfig {
     pub inbound_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<RecordingPolicy>,
+    /// Per-trunk AMD (answering machine / AI assistant) detection config:
+    /// overlays the global `[proxy] amd` per-field; route hints override both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd: Option<crate::media::amd::AmdConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incoming_from_user_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,16 +175,17 @@ pub struct TrunkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header_rules: Option<Vec<HeaderRule>>,
 
-    /// Per-trunk control of whether custom headers from the original INVITE are
-    /// forwarded to this trunk's outbound INVITE.
+    /// Per-trunk control of which custom headers are copied between the call
+    /// legs when this trunk is the destination: the caller's INVITE headers
+    /// onto this trunk's INVITE, and this trunk's 18x/2xx headers back onto
+    /// the caller's responses.
     ///
-    /// - `Some(HeaderPassthrough)` — apply the rule to the original request's
-    ///   custom (non-standard) headers.
-    /// - `None` (default) — strict: no original custom headers are forwarded.
+    /// - `Some(HeaderPassthrough)` — apply the rule in both directions.
+    /// - `None` (default) — strict: no custom headers are copied.
     ///
     /// Destinations resolved as internal (same realm / registered AOR /
-    /// home-proxy) always passthrough all custom headers regardless of this
-    /// setting.
+    /// home-proxy) always passthrough all custom headers, in both directions,
+    /// regardless of this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header_passthrough: Option<HeaderPassthrough>,
 
@@ -160,6 +213,22 @@ pub struct TrunkConfig {
     /// global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice_lite: Option<bool>,
+    /// Pass-through of custom (non-standard) SDP `a=` attributes across the
+    /// B2BUA. Enabled by default (`None`/`true`): vendor-specific attributes
+    /// from the peer's offer/answer are carried across the rewrite into the
+    /// SDP sent to the other side. `false` strips them in both directions —
+    /// custom attributes from this trunk never reach the peer, and the
+    /// trunk's SDP carries none from the peer. Source and destination trunks
+    /// AND together: either side disabled disables pass-through for the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough_custom_sdp_attrs: Option<bool>,
+    /// Per-trunk override of the global `proxy.nat_fix`. When set, SIP
+    /// messages received from this trunk's addresses (`inbound_hosts`, `dest`,
+    /// `backup_dest`; IP literals only) use this value instead of the global
+    /// switch to decide whether a private-IP Contact is rewritten to the
+    /// observed source address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat_fix: Option<bool>,
     /// Network profile id from `[[network_profile]]` in the main config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -177,11 +246,34 @@ pub struct TrunkConfig {
     /// Per-trunk max ring/setup time in seconds before a no-answer rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ring_time: Option<u32>,
+
+    /// Per-trunk maximum call duration in seconds, counted from the start of
+    /// the call; the call is hung up when it is reached. With limits on both
+    /// the source and the destination trunk, the shorter one applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_call_duration: Option<u32>,
+
+    /// Opt-in failure conditions used when a route permits sequential failover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
+
+    /// Per-trunk override of the global `proxy.diversion_headers`: render the
+    /// RFC 5806 `Diversion` header on calls forwarded out through this trunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diversion_headers: Option<bool>,
+    /// Per-trunk override of the global `proxy.history_info`: render the
+    /// RFC 7044 `History-Info` header on calls forwarded out through this
+    /// trunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_info: Option<bool>,
 }
 
-/// Controls which original-request custom headers are forwarded to the
-/// destination leg's INVITE. Standard SIP headers (Via/From/To/Call-ID/CSeq/
-/// Contact/... ) are always excluded regardless of this rule.
+/// Controls which custom headers are copied between call legs: original
+/// INVITE headers onto the destination leg's INVITE, and the destination's
+/// 18x/2xx headers onto the caller's responses. Only custom headers are ever
+/// copied: unparsed `X-`/`P-` headers (see `Dialplan::is_custom_header`).
+/// Standard SIP headers (Via, Require, Identity, P-Asserted-Identity, ...) never
+/// are, regardless of this rule.
 ///
 /// Rule precedence:
 /// - `Whitelist` — forward only the listed headers.
@@ -193,7 +285,8 @@ pub struct TrunkConfig {
 /// - `All` (default) — forward all custom headers; if `whitelist` is non-empty
 ///   it behaves like a whitelist, otherwise a non-empty `blacklist` is honored.
 ///
-/// Header names are matched case-insensitively.
+/// Header names are matched case-insensitively. A list entry ending in `*`
+/// matches by prefix (`X-*`, `P-*`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct HeaderPassthrough {
     #[serde(default)]
@@ -220,6 +313,16 @@ impl HeaderPassthrough {
         Self::default()
     }
 
+    /// Forward no custom headers — an explicit "none" that, unlike an absent
+    /// rule, is not replaced by the per-target default.
+    pub fn none() -> Self {
+        Self {
+            mode: HeaderPassthroughMode::Whitelist,
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+        }
+    }
+
     /// Forward only `X-`-prefixed custom headers — opt-in per trunk for
     /// dial-out-metadata destinations (e.g. the CCF-facing trunk).
     pub fn x_custom() -> Self {
@@ -233,26 +336,31 @@ impl HeaderPassthrough {
     /// Returns `true` if a header with the given (case-insensitive) name should
     /// be forwarded under this rule.
     pub fn allows(&self, name: &str) -> bool {
+        let listed = |list: &[String]| list.iter().any(|p| header_name_matches(p, name));
         match self.mode {
-            HeaderPassthroughMode::Whitelist => {
-                self.whitelist.iter().any(|w| w.eq_ignore_ascii_case(name))
-            }
-            HeaderPassthroughMode::Blacklist => {
-                !self.blacklist.iter().any(|b| b.eq_ignore_ascii_case(name))
-            }
-            HeaderPassthroughMode::XOnly => {
-                name.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("x-"))
-            }
+            HeaderPassthroughMode::Whitelist => listed(&self.whitelist),
+            HeaderPassthroughMode::Blacklist => !listed(&self.blacklist),
+            HeaderPassthroughMode::XOnly => header_name_matches("X-*", name),
             HeaderPassthroughMode::All => {
                 if !self.whitelist.is_empty() {
-                    self.whitelist.iter().any(|w| w.eq_ignore_ascii_case(name))
+                    listed(&self.whitelist)
                 } else if !self.blacklist.is_empty() {
-                    !self.blacklist.iter().any(|b| b.eq_ignore_ascii_case(name))
+                    !listed(&self.blacklist)
                 } else {
                     true
                 }
             }
         }
+    }
+}
+
+/// Case-insensitive header name match; a trailing `*` matches by prefix.
+fn header_name_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix)),
+        None => pattern.eq_ignore_ascii_case(name),
     }
 }
 
@@ -462,6 +570,8 @@ impl Default for TrunkConfig {
         Self {
             dest: String::new(),
             backup_dest: None,
+            amd: None,
+            outbound_proxy: None,
             username: None,
             password: None,
             codec: Vec::new(),
@@ -499,32 +609,22 @@ impl Default for TrunkConfig {
             external_ip: None,
             bind_ip: None,
             ice_lite: None,
+            passthrough_custom_sdp_attrs: None,
+            nat_fix: None,
             profile: None,
             did_numbers: Vec::new(),
             ringback: None,
             max_ring_time: None,
+            max_call_duration: None,
+            retry_policy: None,
+            diversion_headers: None,
+            history_info: None,
             origin: ConfigOrigin::embedded(),
         }
     }
 }
 
 impl TrunkConfig {
-    pub async fn matches_inbound_source_ip(&self, addr: &IpAddr) -> bool {
-        if let Some(trunk_direction) = self.direction
-            && !trunk_direction.allows(&DialDirection::Inbound)
-        {
-            return false;
-        }
-
-        for host in &self.inbound_hosts {
-            if candidate_matches(host, addr).await {
-                return true;
-            }
-        }
-
-        false
-    }
-
     pub async fn matches_inbound_ip(&self, addr: &IpAddr) -> bool {
         for host in &self.inbound_hosts {
             if candidate_matches(host, addr).await {
@@ -1086,7 +1186,7 @@ impl RouteQueueConfig {
 
         let strategy = match self.strategy.mode {
             QueueDialMode::Parallel => DialStrategy::Parallel(locations),
-            QueueDialMode::Sequential => DialStrategy::Sequential(locations),
+            QueueDialMode::Sequential => DialStrategy::Sequential(locations.into_iter().map(Into::into).collect()),
         };
         Ok(Some(strategy))
     }

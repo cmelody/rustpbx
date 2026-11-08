@@ -20,7 +20,11 @@ pub mod console;
 pub mod db_report;
 pub mod handler;
 pub mod license;
+#[cfg(test)]
+#[path = "../tests/common/log_capture.rs"]
+pub(crate) mod log_capture;
 pub mod log_reload;
+mod log_search;
 pub mod log_viewer;
 pub mod mail;
 
@@ -35,6 +39,7 @@ pub mod prelude;
 pub mod proc_stats;
 pub mod proxy;
 pub mod report;
+pub mod rolling;
 pub mod rwi;
 pub mod security;
 pub mod shutdown;

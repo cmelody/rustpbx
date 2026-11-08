@@ -19,11 +19,16 @@
 //!
 //! Ingress DTMF telephone-event packets are detected for the DTMF event bus.
 //! Audio and telephone-event RTP in both directions reach the recording task,
-//! allowing DTMF tones to be synthesized into WAV recordings. Video and unknown
-//! RTP payload types are excluded.
+//! allowing DTMF tones to be synthesized into WAV recordings. Video RTP is
+//! forwarded to a dedicated queue only while the session enabled video
+//! recording (`enable_video_capture`) and the payload type matches the
+//! negotiated video codecs (`set_video_payload_types`, refreshed on every
+//! re-INVITE via `set_recording_profile`); unknown payload types are excluded.
 
+use std::collections::VecDeque;
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -33,19 +38,20 @@ use tokio::sync::broadcast;
 use tracing::trace;
 
 use crate::dtmf::DtmfDetector;
-use crate::media_recorder::RecorderSender;
+use crate::media_recorder::{CaptureChannel, RecorderSender};
 
 /// Lock-free 128-bit payload-type bitmask (PT 0..=127), shared by the DTMF
-/// and recording-audio allowlists.
-struct PtMask([AtomicU64; 2]);
+/// and recording-audio allowlists. Also used by the in-band DTMF tap's
+/// audio-PT filter.
+pub(crate) struct PtMask([AtomicU64; 2]);
 
 impl PtMask {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self([AtomicU64::new(0), AtomicU64::new(0)])
     }
 
     /// Replace the mask contents with `pts`.
-    fn set(&self, pts: &[u8]) {
+    pub(crate) fn set(&self, pts: &[u8]) {
         let mut words = [0u64; 2];
         for &p in pts {
             words[(p as usize) >> 6] |= 1u64 << (p & 63);
@@ -56,7 +62,7 @@ impl PtMask {
 
     /// Lock-free membership check.
     #[inline]
-    fn contains(&self, pt: u8) -> bool {
+    pub(crate) fn contains(&self, pt: u8) -> bool {
         let word = (pt as usize) >> 6;
         let bit = 1u64 << (pt & 63);
         self.0[word].load(Ordering::Relaxed) & bit != 0
@@ -72,11 +78,34 @@ pub enum PacketDirection {
     Egress,
 }
 
-/// A DTMF digit detected on a leg, tagged with its direction.
+/// How a DTMF digit was detected on a leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DtmfSource {
+    /// RFC 2833/4733 telephone-event RTP payload (or SIP INFO, which rides
+    /// the same "signaled" path).
+    Rfc2833,
+    /// Recovered from the audio stream by the in-band Goertzel detector
+    /// (`crate::inband_dtmf`) — only runs when no telephone-event was
+    /// negotiated (or the leg opted in with `inband_dtmf = "on"`).
+    Inband,
+}
+
+impl DtmfSource {
+    /// Wire tag used in RWI `dtmf` event extras and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rfc2833 => "rfc2833",
+            Self::Inband => "inband",
+        }
+    }
+}
+
+/// A DTMF digit detected on a leg, tagged with its direction and source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtmfEvent {
     pub direction: PacketDirection,
     pub digit: char,
+    pub source: DtmfSource,
 }
 
 /// Snapshot of the per-direction counters.
@@ -84,6 +113,41 @@ pub struct DtmfEvent {
 pub(crate) struct TapStats {
     pub ingress_packets: u64,
     pub egress_packets: u64,
+    pub recording_queue_drops: u64,
+    /// Video-queue drops (recorded while video capture is enabled).
+    pub video_queue_drops: u64,
+    pub audio_packet_samples: Option<AudioPacketSamples>,
+}
+
+const AUDIO_PACKET_SAMPLES: usize = 4;
+
+/// Plaintext packet evidence, without retaining audio bytes.
+/// Payload hashes are comparable only within the same process/build.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AudioPacketSample {
+    pub(crate) ssrc: u32,
+    pub(crate) payload_type: u8,
+    pub(crate) sequence: u16,
+    pub(crate) timestamp: u32,
+    pub(crate) payload_bytes: usize,
+    pub(crate) payload_hash: String,
+    pub(crate) peer_addr: std::net::SocketAddr,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AudioPacketSamples {
+    ingress: VecDeque<AudioPacketSample>,
+    // The transport observer runs before SRTP protection and socket sending.
+    // These samples cannot establish wire delivery, even when hashes match.
+    egress_attempts: VecDeque<AudioPacketSample>,
+}
+
+impl AudioPacketSamples {
+    /// Most recent inbound packet seen by this observer (diagnostics anchor
+    /// for stall watchers: "last evidence before the wire went quiet").
+    pub(crate) fn last_ingress(&self) -> Option<&AudioPacketSample> {
+        self.ingress.back()
+    }
 }
 
 /// Plaintext observer for one leg: stats + DTMF detection + recording.
@@ -95,6 +159,8 @@ pub struct IngressTap {
     // ── stats (lock-free) ────────────────────────────────────────────────
     ingress_packets: AtomicU64,
     egress_packets: AtomicU64,
+    audio_packet_samples_enabled: AtomicBool,
+    audio_packet_samples: Mutex<Option<AudioPacketSamples>>,
     /// Whether to keep populating `ingress_ssrc_pts` on the hot path. The map
     /// exists only to let the RTCP relay rewrite a WebRTC receiver's PLI/NACK
     /// back onto the peer's real sender SSRC; for plain RTP↔RTP bridges (no
@@ -130,9 +196,29 @@ pub struct IngressTap {
     /// re-INVITE renegotiates the codec — a stale allowlist would silently
     /// drop every post-renegotiation audio packet from the recording.
     audio_pt_mask: PtMask,
-    /// Sender for the call-scoped recording task. Recording-enabled calls
-    /// supply it when the caller leg is constructed; it then remains immutable
-    /// for the tap's lifetime.
+    /// Video payload types negotiated on this leg, as a 128-bit lock-free
+    /// bitmask. Refreshed from the negotiated leg profile inside
+    /// `set_recording_profile` (which the leg calls on every re-INVITE), so a
+    /// renegotiated video m-line re-arms the allowlist without extra wiring.
+    /// Consulted only while `video_capture_enabled` is set.
+    video_pt_mask: PtMask,
+    /// Whether negotiated video packets are forwarded to the recording task's
+    /// video queue. Off by default; the session turns it on only after an
+    /// MP4-capable recorder is installed in the task, so plain audio
+    /// recordings never see (or drop) video packets.
+    video_capture_enabled: AtomicBool,
+    // Shared snapshots retain the source PT mapping without cloning it per packet.
+    recording_profile: parking_lot::RwLock<Option<Arc<crate::negotiate::NegotiatedLegProfile>>>,
+    /// Capture routing: which recording channel (if any) each direction of
+    /// this leg feeds. Stored as the `CaptureChannel` code (0 = off) in
+    /// atomics so route selection stays lock-free. The caller leg
+    /// uses the classic layout (ingress->Caller, egress->Callee); the callee
+    /// leg starts fully off and switches to ingress->Callee only while the
+    /// call is held (see `set_capture_route`).
+    capture_ingress_channel: AtomicU8,
+    capture_egress_channel: AtomicU8,
+    /// Sender for the call-scoped recording task. Shared by every tapped leg
+    /// of the call; it remains immutable for the tap's lifetime.
     recorder_sender: Option<RecorderSender>,
 }
 
@@ -146,9 +232,21 @@ impl IngressTap {
         recorder_sender: Option<RecorderSender>,
     ) -> Arc<Self> {
         let (dtmf_tx, _) = broadcast::channel(dtmf_bus_capacity.max(1));
+        // Classic caller-tap layout. Legs without a recorder sender never
+        // capture; legs with one can retarget via `set_capture_route`.
+        let default_route = if recorder_sender.is_some() {
+            (
+                CaptureChannel::Caller.code(),
+                CaptureChannel::Callee.code(),
+            )
+        } else {
+            (0, 0)
+        };
         let tap = Arc::new(Self {
             ingress_packets: AtomicU64::new(0),
             egress_packets: AtomicU64::new(0),
+            audio_packet_samples_enabled: AtomicBool::new(false),
+            audio_packet_samples: Mutex::new(None),
             track_ingress_ssrc_pts: AtomicBool::new(true),
             last_ingress_ssrc_pt: AtomicU64::new(u64::MAX),
             ingress_ssrc_pts: DashMap::new(),
@@ -156,10 +254,24 @@ impl IngressTap {
             dtmf_detector: Mutex::new(DtmfDetector::default()),
             dtmf_tx,
             audio_pt_mask: PtMask::new(),
+            video_pt_mask: PtMask::new(),
+            video_capture_enabled: AtomicBool::new(false),
+            recording_profile: parking_lot::RwLock::new(None),
+            capture_ingress_channel: AtomicU8::new(default_route.0),
+            capture_egress_channel: AtomicU8::new(default_route.1),
             recorder_sender,
         });
         tap.set_audio_payload_types(audio_payload_types);
         tap
+    }
+
+    pub(crate) fn enable_audio_packet_samples(&self) {
+        *self.audio_packet_samples.lock() = Some(AudioPacketSamples {
+            ingress: VecDeque::with_capacity(AUDIO_PACKET_SAMPLES),
+            egress_attempts: VecDeque::with_capacity(AUDIO_PACKET_SAMPLES),
+        });
+        self.audio_packet_samples_enabled
+            .store(true, Ordering::Release);
     }
 
     /// Enable/disable hot-path SSRC→PT tracking (see `track_ingress_ssrc_pts`).
@@ -190,6 +302,54 @@ impl IngressTap {
         self.audio_pt_mask.set(&pts);
     }
 
+    /// Set the negotiated video payload type(s) for this leg. Normally driven
+    /// automatically by `set_recording_profile`; exposed for tests and for
+    /// leg setups that bypass the profile path.
+    pub fn set_video_payload_types(&self, pts: Vec<u8>) {
+        self.video_pt_mask.set(&pts);
+    }
+
+    /// Enable/disable forwarding negotiated video RTP to the recording task's
+    /// video queue (lock-free, safe mid-call). The session enables it after
+    /// installing a video-capable recorder and disables it on recorder
+    /// teardown so the tap stops feeding a backend that no longer consumes.
+    pub fn enable_video_capture(&self, enabled: bool) {
+        self.video_capture_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_recording_profile(&self, profile: crate::negotiate::NegotiatedLegProfile) {
+        let video_pts: Vec<u8> = profile.video.iter().map(|c| c.payload_type).collect();
+        self.video_pt_mask.set(&video_pts);
+        *self.recording_profile.write() = Some(Arc::new(profile));
+    }
+
+    /// Retarget this leg's recording capture (lock-free, safe mid-call).
+    ///
+    /// Used by the session to switch the recorder's data sources when a leg
+    /// is held: the callee leg's ingress becomes the B channel (the agent's
+    /// live mic -- the audio the bridge no longer relays), and the caller
+    /// leg's egress capture is dropped (it only carries comfort noise / hold
+    /// music, which would interleave with the mic stream on the same
+    /// sequential channel). `None` disables capture for that direction.
+    pub fn set_capture_route(
+        &self,
+        ingress: Option<CaptureChannel>,
+        egress: Option<CaptureChannel>,
+    ) {
+        self.capture_ingress_channel
+            .store(ingress.map(|c| c.code()).unwrap_or(0), Ordering::Relaxed);
+        self.capture_egress_channel
+            .store(egress.map(|c| c.code()).unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Read back the current capture route (tests / diagnostics).
+    pub fn capture_route(&self) -> (Option<CaptureChannel>, Option<CaptureChannel>) {
+        (
+            CaptureChannel::from_code(self.capture_ingress_channel.load(Ordering::Relaxed)),
+            CaptureChannel::from_code(self.capture_egress_channel.load(Ordering::Relaxed)),
+        )
+    }
+
     /// Lock-free audio-codec check: is `pt` one of the allowlisted audio
     /// payload types?
     #[inline]
@@ -202,11 +362,30 @@ impl IngressTap {
         self.dtmf_tx.subscribe()
     }
 
+    /// The DTMF broadcast sender, for producers that feed the same channel
+    /// from outside this tap (the in-band audio DTMF detector injects its
+    /// digits here tagged [`DtmfSource::Inband`], so downstream subscribers
+    /// see one unified event stream).
+    pub(crate) fn dtmf_event_sender(&self) -> broadcast::Sender<DtmfEvent> {
+        self.dtmf_tx.clone()
+    }
+
     /// Snapshot the per-direction counters.
     pub(crate) fn stats(&self) -> TapStats {
         TapStats {
             ingress_packets: self.ingress_packets.load(Ordering::Relaxed),
             egress_packets: self.egress_packets.load(Ordering::Relaxed),
+            recording_queue_drops: self
+                .recorder_sender
+                .as_ref()
+                .map(|sender| sender.dropped_packets())
+                .unwrap_or(0),
+            video_queue_drops: self
+                .recorder_sender
+                .as_ref()
+                .map(|sender| sender.dropped_video_packets())
+                .unwrap_or(0),
+            audio_packet_samples: self.audio_packet_samples.lock().clone(),
         }
     }
 
@@ -230,7 +409,12 @@ impl IngressTap {
 
     /// Shared processing for both directions: stats + DTMF + record.
     #[inline]
-    fn process(&self, direction: PacketDirection, packet: &RtpPacket) {
+    fn process(
+        &self,
+        direction: PacketDirection,
+        packet: &RtpPacket,
+        peer_addr: std::net::SocketAddr,
+    ) {
         match direction {
             PacketDirection::Ingress => {
                 self.ingress_packets.fetch_add(1, Ordering::Relaxed);
@@ -262,6 +446,33 @@ impl IngressTap {
         // the destination leg and could poison this tap's deduplication state.
         // Raw telephone-event RTP in both directions still reaches the recorder.
         let pt = packet.header.payload_type;
+        if self.audio_packet_samples_enabled.load(Ordering::Acquire)
+            && self.is_audio_payload_type(pt)
+        {
+            // Compare payloads across this instance's ingress/egress boundaries;
+            // RTP headers legitimately change during relay. No decode or raw audio log.
+            let mut hash = DefaultHasher::new();
+            hash.write(&packet.payload);
+            let sample = AudioPacketSample {
+                ssrc: packet.header.ssrc,
+                payload_type: pt,
+                sequence: packet.header.sequence_number,
+                timestamp: packet.header.timestamp,
+                payload_bytes: packet.payload.len(),
+                payload_hash: format!("{:016x}", hash.finish()),
+                peer_addr,
+            };
+            if let Some(samples) = self.audio_packet_samples.lock().as_mut() {
+                let samples = match direction {
+                    PacketDirection::Ingress => &mut samples.ingress,
+                    PacketDirection::Egress => &mut samples.egress_attempts,
+                };
+                if samples.len() == AUDIO_PACKET_SAMPLES {
+                    samples.pop_front();
+                }
+                samples.push_back(sample);
+            }
+        }
         if direction == PacketDirection::Ingress && self.is_dtmf_payload_type(pt) {
             let payload_len = packet.payload.len();
             trace!(pt, len = payload_len, "tap: telephone-event packet");
@@ -270,7 +481,11 @@ impl IngressTap {
                 .lock()
                 .observe(&packet.payload, packet.header.timestamp);
             if let Some(digit) = digit {
-                let event = DtmfEvent { direction, digit };
+                let event = DtmfEvent {
+                    direction,
+                    digit,
+                    source: DtmfSource::Rfc2833,
+                };
                 // Broadcast (lagged subscribers dropped, never blocks).
                 let _ = self.dtmf_tx.send(event);
             }
@@ -278,21 +493,39 @@ impl IngressTap {
 
         // Preserve telephone-event packets for recording, including duration
         // updates and terminal repeats suppressed by the digit event detector.
-        if (self.is_audio_payload_type(pt) || self.is_dtmf_payload_type(pt))
+        // The leg's capture route (see `set_capture_route`) decides whether --
+        // and into which channel -- each direction is recorded. Negotiated
+        // video packets ride the dedicated video queue only while the session
+        // enabled video capture (see `enable_video_capture`).
+        let video_capture = self.video_capture_enabled.load(Ordering::Relaxed)
+            && self.video_pt_mask.contains(pt);
+        if (self.is_audio_payload_type(pt) || self.is_dtmf_payload_type(pt) || video_capture)
             && let Some(sender) = self.recorder_sender.as_ref()
         {
-            sender.capture(direction, packet);
+            let code = match direction {
+                PacketDirection::Ingress => self.capture_ingress_channel.load(Ordering::Relaxed),
+                PacketDirection::Egress => self.capture_egress_channel.load(Ordering::Relaxed),
+            };
+            if let Some(channel) = CaptureChannel::from_code(code) {
+                let profile = self.recording_profile.read().clone();
+                if video_capture {
+                    trace!(pt, ?channel, seq = packet.header.sequence_number, "tap: video packet forwarded to recorder");
+                    sender.capture_video_with_profile(channel, packet, Some(peer_addr), profile);
+                } else {
+                    sender.capture_with_profile(channel, packet, Some(peer_addr), profile);
+                }
+            }
         }
     }
 }
 
 impl RtpObserver for IngressTap {
-    fn on_ingress(&self, packet: &RtpPacket, _src_addr: std::net::SocketAddr) {
-        self.process(PacketDirection::Ingress, packet);
+    fn on_ingress(&self, packet: &RtpPacket, src_addr: std::net::SocketAddr) {
+        self.process(PacketDirection::Ingress, packet, src_addr);
     }
 
-    fn on_egress(&self, packet: &RtpPacket, _dst_addr: std::net::SocketAddr) {
-        self.process(PacketDirection::Egress, packet);
+    fn on_egress(&self, packet: &RtpPacket, dst_addr: std::net::SocketAddr) {
+        self.process(PacketDirection::Egress, packet, dst_addr);
     }
 }
 
@@ -301,6 +534,7 @@ mod tests {
     use super::*;
     use rustrtc::rtp::{RtpHeader, RtpPacket};
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
 
     fn make_packet(pt: u8, seq: u16, ts: u32, ssrc: u32, payload: Vec<u8>) -> RtpPacket {
         RtpPacket::new(RtpHeader::new(pt, seq, ts, ssrc), payload)
@@ -348,6 +582,121 @@ mod tests {
         assert_ne!(tap.ingress_ssrc_for_pts(&[96]), Some(9999));
         // Unknown PT → None.
         assert_eq!(tap.ingress_ssrc_for_pts(&[110]), None);
+    }
+
+    /// Test backend that tallies audio vs video writes reaching the task.
+    struct KindCountingRecorder {
+        counts: Arc<(AtomicUsize, AtomicUsize)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media_recorder::MediaRecorder for KindCountingRecorder {
+        async fn initialize(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn write_rtp(
+            &mut self,
+            _channel: crate::media_recorder::CaptureChannel,
+            packet: &RtpPacket,
+            _received_at_micros: u64,
+            _peer_addr: Option<std::net::SocketAddr>,
+        ) -> anyhow::Result<()> {
+            // PT 96 is the negotiated video PT in these fixtures; anything
+            // else counts as audio.
+            if packet.header.payload_type == 96 {
+                self.counts.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.counts.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        async fn finalize(
+            self: Box<Self>,
+        ) -> anyhow::Result<Option<crate::media_recorder::RecordingResult>> {
+            Ok(None)
+        }
+    }
+
+    fn video_profile(pt: u8) -> crate::negotiate::NegotiatedLegProfile {
+        crate::negotiate::NegotiatedLegProfile {
+            video: vec![crate::negotiate::NegotiatedVideoCodec {
+                name: "H264".to_string(),
+                payload_type: pt,
+                clock_rate: 90000,
+                fmtp: None,
+                rtcp_fbs: Vec::new(),
+                rtx_payload_type: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn video_packets_forwarded_only_while_capture_enabled() {
+        use std::sync::atomic::Ordering;
+        let (handle, sender, _finished) = crate::media_recorder::RecorderHandle::new();
+        let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let tap = IngressTap::new(8, vec![0], Some(sender));
+        tap.set_recording_profile(video_profile(96));
+        handle
+            .set_recorder(
+                Box::new(KindCountingRecorder {
+                    counts: Arc::clone(&counts),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let video = make_packet(96, 1, 3000, 42, vec![5u8; 100]);
+        // Gate disabled (default): the negotiated video packet must NOT reach
+        // the recording task.
+        tap.on_ingress(&video, test_addr());
+        // Enabled: the same packet now rides the video queue.
+        tap.enable_video_capture(true);
+        tap.on_ingress(&video, test_addr());
+        // Audio unaffected by the gate.
+        tap.on_ingress(&make_packet(0, 1, 160, 43, vec![7u8; 80]), test_addr());
+        // Unknown PT stays excluded even while enabled.
+        tap.on_ingress(&make_packet(97, 1, 3000, 44, vec![9u8; 50]), test_addr());
+
+        handle.stop_recorder().await.unwrap();
+        assert_eq!(counts.0.load(Ordering::SeqCst), 1, "video packet count");
+        assert_eq!(counts.1.load(Ordering::SeqCst), 1, "audio packet count");
+    }
+
+    #[tokio::test]
+    async fn reinvite_refreshes_video_allowlist() {
+        use std::sync::atomic::Ordering;
+        let (handle, sender, _finished) = crate::media_recorder::RecorderHandle::new();
+        let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let tap = IngressTap::new(8, vec![0], Some(sender));
+        tap.set_recording_profile(video_profile(96));
+        // Re-INVITE moves video to PT 98: the profile refresh must re-arm the
+        // allowlist, otherwise every post-renegotiation packet would be
+        // silently excluded from the recording.
+        tap.set_recording_profile(video_profile(98));
+        handle
+            .set_recorder(
+                Box::new(KindCountingRecorder {
+                    counts: Arc::clone(&counts),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        tap.enable_video_capture(true);
+        tap.on_ingress(&make_packet(98, 1, 3000, 45, vec![5u8; 100]), test_addr());
+        // Old PT no longer matches the allowlist.
+        tap.on_ingress(&make_packet(96, 2, 6000, 45, vec![5u8; 100]), test_addr());
+
+        handle.stop_recorder().await.unwrap();
+        // The recorder classifies PT 96 as "video", everything else as
+        // "other": exactly one packet (the renegotiated PT 98) may arrive.
+        assert_eq!(counts.0.load(Ordering::SeqCst), 0, "stale PT must be excluded");
+        assert_eq!(counts.1.load(Ordering::SeqCst), 1, "renegotiated PT count");
     }
 
     #[test]
@@ -409,19 +758,58 @@ mod tests {
 
         let packets: Vec<_> = std::iter::from_fn(|| captured.try_recv().ok()).collect();
         assert_eq!(packets.len(), 5);
-        assert_eq!(packets[0].direction, PacketDirection::Ingress);
+        assert_eq!(packets[0].channel, CaptureChannel::Caller);
         assert_eq!(packets[0].packet.header.payload_type, 0);
-        assert_eq!(packets[1].direction, PacketDirection::Egress);
+        assert_eq!(packets[1].channel, CaptureChannel::Callee);
         assert_eq!(packets[1].packet.header.payload_type, 8);
-        for (packet, direction) in packets[2..].iter().zip([
-            PacketDirection::Ingress,
-            PacketDirection::Egress,
-            PacketDirection::Ingress,
+        for (packet, channel) in packets[2..].iter().zip([
+            CaptureChannel::Caller,
+            CaptureChannel::Callee,
+            CaptureChannel::Caller,
         ]) {
-            assert_eq!(packet.direction, direction);
+            assert_eq!(packet.channel, channel);
             assert_eq!(packet.packet.header.payload_type, 101);
             assert_eq!(packet.packet.payload, dtmf.payload);
         }
+    }
+
+    /// Capture routing: a tap can be retargeted mid-call -- the callee leg's
+    /// ingress becomes the B channel during hold, and disabling a direction
+    /// stops its capture entirely.
+    #[test]
+    fn capture_route_switches_channels_and_disables_directions() {
+        let (tx, mut captured) = tokio::sync::mpsc::channel(16);
+        let sender = RecorderSender::new(tx);
+        let tap = IngressTap::new(8, vec![0], Some(sender));
+
+        // Default (caller layout): ingress->Caller, egress->Callee.
+        tap.on_ingress(&make_packet(0, 1, 160, 1, vec![1u8; 160]), test_addr());
+        tap.on_egress(&make_packet(0, 2, 320, 1, vec![1u8; 160]), test_addr());
+
+        // Callee-leg hold layout: ingress->Callee, egress off.
+        tap.set_capture_route(Some(CaptureChannel::Callee), None);
+        tap.on_ingress(&make_packet(0, 3, 480, 1, vec![1u8; 160]), test_addr());
+        tap.on_egress(&make_packet(0, 4, 640, 1, vec![1u8; 160]), test_addr());
+
+        let packets: Vec<_> = std::iter::from_fn(|| captured.try_recv().ok()).collect();
+        assert_eq!(packets.len(), 3, "disabled egress must not capture");
+        assert_eq!(packets[0].channel, CaptureChannel::Caller);
+        assert_eq!(packets[0].packet.header.sequence_number, 1);
+        assert_eq!(packets[1].channel, CaptureChannel::Callee);
+        assert_eq!(packets[1].packet.header.sequence_number, 2);
+        assert_eq!(packets[2].channel, CaptureChannel::Callee);
+        assert_eq!(packets[2].packet.header.sequence_number, 3);
+    }
+
+    /// A tap created without a recorder sender captures nothing regardless of
+    /// route.
+    #[test]
+    fn capture_route_without_sender_is_inert() {
+        let tap = IngressTap::new(8, vec![0], None);
+        tap.set_capture_route(Some(CaptureChannel::Callee), Some(CaptureChannel::Callee));
+        tap.on_ingress(&make_packet(0, 1, 160, 1, vec![1u8; 160]), test_addr());
+        tap.on_egress(&make_packet(0, 2, 320, 1, vec![1u8; 160]), test_addr());
+        // No panic, no captures (nothing to observe without a channel).
     }
 
     #[test]

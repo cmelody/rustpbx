@@ -64,7 +64,7 @@ impl SipSession {
         // to an app runs the in-session hand-off like the blind path.
         let app_target = if !conference_target && !locator_direct {
             match Self::resolve_refer_app_target(
-                &self.server, &self.context.session_id, &target_uri, &TransactionCookie::default(),
+                &self.server, &self.context.session_id, &target_uri, None, &TransactionCookie::default(),
             ).await {
                 Ok(target) => target,
                 Err((code, reason)) if replaces_header.is_none() => {
@@ -222,9 +222,16 @@ impl SipSession {
             if owner.session_id() == self.context.session_id {
                 return Err((501, "Same-session Replaces is not supported by this cross-session path".into()));
             }
+            // Queue dispatch and replacement agents use dynamic leg IDs.
+            // Accept the caller or the currently selected callee, while keeping
+            // consultation and retired dialogs outside this transfer path.
             let transferor = self.resolve_transfer_leg();
-            if self.legs.get_dialog(&transferor).is_none_or(|dialog| dialog.id() != *source_dialog) {
-                return Err((481, "REFER must originate from the current callee".into()));
+            let from_primary_leg = self.caller_dialog.as_ref()
+                .is_some_and(|dialog| dialog.id() == *source_dialog)
+                || self.legs.get_dialog(&transferor)
+                    .is_some_and(|dialog| dialog.id() == *source_dialog);
+            if !from_primary_leg {
+                return Err((481, "REFER must originate from a party of this call".into()));
             }
             if self.meta.transfer_in_progress || self.conference.is_some() {
                 return Err((491, "Call is already transferring or in a conference".into()));
@@ -318,7 +325,10 @@ impl SipSession {
     /// (a peer node's registration counts; `handle_add_leg` dials the full
     /// Location so cross-node home_proxy routing is preserved). Fails open
     /// on locator errors.
-    async fn refer_target_locally_registered(server: &SipServerRef, target_uri: &str) -> bool {
+    pub(super) async fn refer_target_locally_registered(
+        server: &SipServerRef,
+        target_uri: &str,
+    ) -> bool {
         let Ok(parsed) = rsipstack::sip::Uri::try_from(target_uri) else {
             return false;
         };
@@ -335,10 +345,13 @@ impl SipSession {
     }
 
     /// Resolve REFER feature codes and application routes without executing a transfer.
-    async fn resolve_refer_app_target(
+    /// Routes match on the original caller: `caller` when the session knows
+    /// it, otherwise looked up by `original_session_id`.
+    pub(crate) async fn resolve_refer_app_target(
         server: &SipServerRef,
         original_session_id: &str,
         target_uri: &str,
+        caller: Option<rsipstack::sip::Uri>,
         cookie: &crate::call::cookie::TransactionCookie,
     ) -> Result<Option<String>, (u16, String)> {
         if let Some(resolver) = server.quick_route_resolver.as_ref() {
@@ -366,16 +379,21 @@ impl SipSession {
         };
         // Route matching uses the original caller. Application destinations
         // must also resolve on servers without an RWI gateway.
-        let Some(caller_str) = server.rwi_gateway.as_ref().and_then(|gw| {
-            gw.read()
-                .meta_store
-                .get_sync(original_session_id)
-                .and_then(|m| m.caller)
-        }).or_else(|| server.active_call_registry.get(original_session_id).and_then(|call| call.caller)) else {
-            return Err((500, "REFER route lookup has no original caller identity".to_string()));
+        let caller_uri = match caller {
+            Some(caller) => caller,
+            None => {
+                let Some(caller_str) = server.rwi_gateway.as_ref().and_then(|gw| {
+                    gw.read()
+                        .meta_store
+                        .get_sync(original_session_id)
+                        .and_then(|m| m.caller)
+                }).or_else(|| server.active_call_registry.get(original_session_id).and_then(|call| call.caller)) else {
+                    return Err((500, "REFER route lookup has no original caller identity".to_string()));
+                };
+                rsipstack::sip::Uri::try_from(caller_str.as_str())
+                    .map_err(|_| (500, "REFER route lookup has invalid original caller identity".to_string()))?
+            }
         };
-        let caller_uri = rsipstack::sip::Uri::try_from(caller_str.as_str())
-            .map_err(|_| (500, "REFER route lookup has invalid original caller identity".to_string()))?;
         let routed = crate::proxy::proxy_call::sip_session::route_outbound_leg(
             server,
             &parsed,
@@ -435,7 +453,7 @@ impl SipSession {
     }
 
     /// Side-effect-free probe: is this dialled user a known cc agent extension?
-    async fn refer_target_cc_agent(server: &SipServerRef, user: &str) -> Option<String> {
+    pub(super) async fn refer_target_cc_agent(server: &SipServerRef, user: &str) -> Option<String> {
         let registry = server.agent_registry.as_ref()?;
         let target = format!("agent:{user}");
         registry
@@ -446,7 +464,7 @@ impl SipSession {
 
     /// `app_params.file` → IVR display name
     /// ("config/ivr/x.toml" → "x", "db://ivr/x.generated.toml" → "x").
-    fn ivr_display_name(file: &str) -> Option<String> {
+    pub(super) fn ivr_display_name(file: &str) -> Option<String> {
         let base = file.rsplit('/').next()?.trim();
         let base = base.strip_suffix(".toml").unwrap_or(base);
         let base = base.strip_suffix(".generated").unwrap_or(base);
@@ -539,13 +557,33 @@ impl SipSession {
             "Max-Forwards".into(),
             "70".into(),
         )];
+        // Wire form of the root session id for the INVITE below: native short
+        // ids ride a raw Session-ID header (rsipstack's InviteOption.session_id
+        // validation only accepts 32 hex chars).
+        let transfer_session_id =
+            crate::call::session_id::build_wire_header(Some(&root_session_id));
+        if let Some(header) = transfer_session_id.1.clone() {
+            headers.push(header);
+        }
         // Carry the root session id to the transfer target via UUI so an
-        // external network leg can re-attach on the way back in.
+        // external network leg can re-attach on the way back in, and declare
+        // the leg intent: a cluster peer that terminates the INVITE as its
+        // own session then knows this is a child leg of the logical call,
+        // not a new call (no duplicate call_created / call_answered
+        // lifecycle there). A REGISTERED agent target declares `leg=agent`
+        // — its home node runs the child dialog with the agent attribution
+        // (the dial-time "transfer" intent must not survive into events);
+        // anything else keeps `leg=transfer`.
+        let refer_role = match Self::uri_user_part(target_uri) {
+            Some(user) if Self::refer_target_cc_agent(server, &user).await.is_some() => "agent",
+            _ => "transfer",
+        };
         headers.push(crate::call::uui::build_uui_header(
             &root_session_id,
             None,
             None,
             None,
+            Some(refer_role),
         ));
         let media = server.default_media_config();
         let external_ip = media
@@ -559,15 +597,14 @@ impl SipSession {
                 .with_cancel_token(tokio_util::sync::CancellationToken::new())
                 .with_enable_latching(media.enable_latching)
                 .with_probation_max_packets(media.probation_max_packets)
-                .with_external_ip(external_ip)
+                .with_external_ips(external_ip.parse().ok().into_iter().collect())
                 // Plain-RTP builder (default mode): honor the global ICE-lite
                 // knob; WebRTC is not involved on this path.
                 .with_ice_lite(media.ice_lite)
                 .with_cname(server.rtc_cname.clone());
-        let media_track = if let Some(bind_ip) = media.bind_ip.clone() {
-            media_track.with_bind_ip(bind_ip)
-        } else {
-            media_track
+        let media_track = match media.bind_ip.as_deref().map(str::parse) {
+            Some(Ok(bind_ip)) => media_track.with_bind_ips(vec![bind_ip]),
+            _ => media_track,
         }
         .build();
 
@@ -586,10 +623,10 @@ impl SipSession {
             credential: None,
             headers: Some(headers),
             call_id: Some(new_call_id.clone()),
-            // RFC 7989: carry the root session id when it is UUID-shaped so
+            // RFC 7989: carry the root session id when it is id-shaped so
             // the transfer target correlates the logical call. Legacy root
             // ids (raw Call-IDs) keep relying on the UUI header above.
-            session_id: crate::call::session_id::normalize(&root_session_id),
+            session_id: transfer_session_id.0,
             ..Default::default()
         };
 

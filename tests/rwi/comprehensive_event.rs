@@ -202,6 +202,8 @@ async fn test_comprehensive_core_event_structs() {
         gw.fan_out(
             "default",
             &rustpbx::rwi::CallCreated {
+                leg_id: None,
+                leg_role: None,
                 call_id: call_id.into(),
                 context: "default".into(),
                 caller: "sip:alice@test.local".into(),
@@ -225,14 +227,16 @@ async fn test_comprehensive_core_event_structs() {
                 early_media: false,
                 agent_id: None,
                 agent_name: None,
-            },
+                leg_role: None,
+},
         );
         gw.fan_out(
             "default",
             &rustpbx::rwi::CallAnswered {
                 leg_id: None,
                 call_id: call_id.into(),
-            },
+                leg_role: None,
+},
         );
         gw.fan_out(
             "default",
@@ -268,6 +272,9 @@ async fn test_comprehensive_core_event_structs() {
                 call_id: call_id.into(),
                 queue_id: "support".into(),
                 skill_groups: Some(vec!["support".into()]),
+                priority: None,
+                attempt: None,
+                agent_id: None,
             },
         );
         gw.fan_out(
@@ -284,13 +291,14 @@ async fn test_comprehensive_core_event_structs() {
             &rustpbx::rwi::IvrStepTrace {
                 call_id: call_id.into(),
                 session_id: "ivr-session-001".into(),
+                app_execution_id: Some(1),
                 caller: "alice".into(),
                 callee: "bob".into(),
                 step_index: 1,
-                trigger: rustpbx::rwi::TriggerInfo::with_detail(
-                    "dtmf",
-                    serde_json::json!({ "digit": "1" }),
-                ),
+                trigger: rustpbx::rwi::TriggerInfo::Dtmf {
+                    digit: "1".into(),
+                    digits: None,
+                },
                 action_type: "prompt".into(),
                 action_json: None,
                 duration_ms: 12,
@@ -371,6 +379,7 @@ async fn test_comprehensive_core_event_structs() {
             &rustpbx::rwi::MediaPlayStarted {
                 call_id: call_id.into(),
                 leg_id: None,
+                leg_role: None,
                 track_id: "prompt-1".into(),
             },
         );
@@ -379,6 +388,7 @@ async fn test_comprehensive_core_event_structs() {
             &rustpbx::rwi::MediaPlayFinished {
                 call_id: call_id.into(),
                 leg_id: None,
+                leg_role: None,
                 track_id: "prompt-1".into(),
                 interrupted: false,
             },
@@ -390,18 +400,21 @@ async fn test_comprehensive_core_event_structs() {
                 digit: "1".into(),
                 leg_id: None,
                 extra: None,
-            },
+                leg_role: None,
+},
         );
         gw.fan_out(
             "default",
             &rustpbx::rwi::CallHangup {
                 leg_id: None,
                 call_id: call_id.into(),
+                scope: rustpbx::rwi::CallHangupScope::Call,
                 reason: Some("normal".into()),
                 hangup_by: None,
                 sip_status: Some(200),
                 duration_secs: None,
-            },
+                leg_role: None,
+},
         );
 
         gw.broadcast(&rustpbx::rwi::ConferenceCreated {
@@ -503,7 +516,8 @@ async fn test_new_api_event_structs() {
             early_media: false,
             agent_id: None,
             agent_name: None,
-        });
+            leg_role: None,
+});
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -515,11 +529,13 @@ async fn test_new_api_event_structs() {
         gw.broadcast(&rustpbx::rwi::CallHangup {
             leg_id: None,
             call_id: call_id.into(),
+            scope: rustpbx::rwi::CallHangupScope::Call,
             reason: Some("normal".into()),
             hangup_by: None,
             sip_status: Some(200),
             duration_secs: None,
-        });
+            leg_role: None,
+});
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -533,7 +549,8 @@ async fn test_new_api_event_structs() {
             &rustpbx::rwi::CallAnswered {
                 leg_id: None,
                 call_id: call_id.into(),
-            },
+                leg_role: None,
+},
         );
     }
 
@@ -606,65 +623,4 @@ async fn test_new_api_event_structs() {
     ctx.pbx.stop();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CC addon event structs (new API)
-// ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "addon-cc")]
-#[tokio::test]
-async fn test_new_cc_event_structs() {
-    let _ = tracing_subscriber::fmt::try_init();
-
-    let ctx = TestCtx::new().await;
-
-    let gw = ctx.gw();
-    gw.broadcast(&rustpbx::addons::cc::cc_events::AgentStateChanged {
-        agent_id: "a1".into(),
-        from_status: "offline".into(),
-        to_status: "idle".into(),
-        call_id: None,
-        agent_name: None,
-        agent_extension: None,
-        caller: None,
-        team_id: None,
-        duration_secs: None,
-        reason_code: Some("registered".into()),
-    });
-    gw.broadcast(&rustpbx::rwi::QueueJoined {
-        call_id: "c1".into(),
-        queue_id: "q1".into(),
-        skill_groups: Some(vec!["q1".into()]),
-    });
-    gw.broadcast(&rustpbx::addons::cc::cc_events::AgentRegistered {
-        agent_id: "a2".into(),
-        agent_name: None,
-        agent_extension: None,
-        team_id: None,
-    });
-    drop(gw);
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let events = ctx.log.snapshot().await;
-    let r1 = events
-        .iter()
-        .filter(|v| v.get("event_type").and_then(|s| s.as_str()) == Some("agent_state_changed"))
-        .count();
-    let r2 = events
-        .iter()
-        .filter(|v| v.get("event_type").and_then(|s| s.as_str()) == Some("queue_joined"))
-        .count();
-    let r3 = events
-        .iter()
-        .filter(|v| v.get("event_type").and_then(|s| s.as_str()) == Some("agent_registered"))
-        .count();
-
-    assert!(r1 > 0, "agent_state_changed not received");
-    assert!(r2 > 0, "queue_joined not received");
-    assert!(r3 > 0, "agent_registered not received");
-
-    println!(
-        "  CC events: agent_state_changed x{r1}, queue_joined x{r2}, agent_registered x{r3} ✅"
-    );
-    ctx.pbx.stop();
-}

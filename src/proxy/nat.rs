@@ -1,21 +1,83 @@
+use arc_swap::ArcSwap;
+use ipnet::IpNet;
+use prefix_trie::joint::JointPrefixSet;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{HostWithPort, SipMessage, ToTypedHeader};
 use rsipstack::transaction::endpoint::MessageInspector;
 use rsipstack::transport::SipAddr;
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use tracing::debug;
 
-pub struct NatInspector;
+use super::data::ProxyDataContext;
+use super::routing::TrunkConfig;
+
+/// Rewrites private-IP Contacts on received messages to the observed source
+/// address.
+///
+/// The global `proxy.nat_fix` is the default; trunks whose own `nat_fix`
+/// differs from it form an exception list keyed by source network. With the
+/// global switch on the list is a blacklist (messages from those trunks are
+/// left alone), with it off a whitelist (only those trunks are fixed). The
+/// list is replaced on every trunk reload via [`NatInspector::update_trunks`].
+///
+/// Messages carrying a Record-Route/Route set are left alone as well: the
+/// dialog path is pinned by the route set, so the Contact is consumed only
+/// by the peer's last-hop proxy — the one that advertised the route and can
+/// reach the (possibly private) address itself. Rewriting it buys nothing.
+#[derive(Clone)]
+pub struct NatInspector {
+    enabled: bool,
+    exceptions: Arc<ArcSwap<JointPrefixSet<IpNet>>>,
+}
 
 impl Default for NatInspector {
     fn default() -> Self {
-        Self::new()
+        Self::new(true)
     }
 }
 
 impl NatInspector {
-    pub fn new() -> Self {
-        Self
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            exceptions: Arc::new(ArcSwap::from_pointee(JointPrefixSet::new())),
+        }
+    }
+
+    /// Rebuild the exception list from the current trunks: every enabled
+    /// trunk whose `nat_fix` is set and differs from the global default
+    /// contributes its `inbound_hosts`, `dest` and `backup_dest` (IP/CIDR
+    /// entries only; hostnames are not resolved).
+    pub fn update_trunks(&self, trunks: &HashMap<String, TrunkConfig>) {
+        let mut exceptions = JointPrefixSet::new();
+        for trunk in trunks.values() {
+            if trunk.nat_fix.is_none_or(|enabled| enabled == self.enabled)
+                || trunk.disabled == Some(true)
+            {
+                continue;
+            }
+            let networks = trunk
+                .inbound_hosts
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(trunk.dest.as_str()))
+                .chain(trunk.backup_dest.as_deref())
+                .filter_map(ProxyDataContext::dest_to_ipnet);
+            for network in networks {
+                exceptions.insert(network);
+            }
+        }
+        self.exceptions.store(Arc::new(exceptions));
+    }
+
+    fn enabled_for(&self, from: &SipAddr) -> bool {
+        let rsipstack::sip::Host::IpAddr(ip) = &from.addr.host else {
+            return self.enabled;
+        };
+        let listed = self.exceptions.load().get_lpm(&IpNet::from(*ip)).is_some();
+        self.enabled != listed
     }
 
     fn is_private_ip(ip: &IpAddr) -> bool {
@@ -25,6 +87,21 @@ impl NatInspector {
             }
             IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
         }
+    }
+
+    /// A Record-Route/Route header means a route set already pins the dialog's
+    /// hop-by-hop path: every in-dialog request is delivered along it and the
+    /// Contact is consumed only by the last-hop proxy on the peer's side.
+    /// That proxy advertised the route exactly so it can reach the (possibly
+    /// private) Contact itself — rewriting it to the observed source would
+    /// not improve reachability, so the NAT fix is skipped.
+    fn has_route_set(headers: &rsipstack::sip::Headers) -> bool {
+        headers.iter().any(|h| {
+            matches!(
+                h,
+                rsipstack::sip::Header::RecordRoute(_) | rsipstack::sip::Header::Route(_)
+            )
+        })
     }
 
     fn fix_contact_header(
@@ -38,7 +115,7 @@ impl NatInspector {
     }
 }
 
-/// Core rewrite logic operating on an inbound INVITE/REGISTER request.
+/// Core rewrite logic operating on an inbound INVITE request.
 ///
 /// `source_port` is the actual transport source port, used as a fallback when
 /// the Via has no `rport`.
@@ -46,10 +123,16 @@ fn fix_nated_contact_in_request(
     req: &mut rsipstack::sip::Request,
     source_port: Option<u16>,
 ) -> bool {
-    if !matches!(
-        req.method,
-        rsipstack::sip::Method::Invite | rsipstack::sip::Method::Register
-    ) {
+    // REGISTER Contact identifies the binding across reconnects; the registrar
+    // stores the reachable transport flow separately as its destination.
+    if req.method != rsipstack::sip::Method::Invite {
+        return false;
+    }
+
+    // A Record-Route/Route set already governs in-dialog routing: the peer's
+    // last-hop proxy reaches its own private Contact itself, rewriting the
+    // header buys nothing.
+    if NatInspector::has_route_set(&req.headers) {
         return false;
     }
 
@@ -90,8 +173,7 @@ fn fix_nated_contact_in_request(
     }
     if changed {
         debug!(
-            received = %received_ip,
-            port = ?target.port,
+            source = %target,
             method = %req.method,
             "Fixed NATed Contact on inbound INVITE/REGISTER"
         );
@@ -215,8 +297,22 @@ impl MessageInspector for NatInspector {
     fn after_received(&self, msg: SipMessage, from: Option<&SipAddr>) -> SipMessage {
         let mut msg = msg;
         let Some(from) = from else { return msg };
+        if !self.enabled_for(from) {
+            return msg;
+        }
 
-        // ── Request side: fix Caller Contact for INVITE/REGISTER ────────
+        // WebSocket clients keep their registered Contact across reconnects;
+        // the locator stores the current reachable flow separately. Rewriting
+        // a dialog Contact to this flow's peer address breaks that identity and
+        // strands in-dialog requests at the old address after a reconnect.
+        if matches!(
+            from.r#type,
+            Some(rsipstack::sip::Transport::Ws | rsipstack::sip::Transport::Wss)
+        ) {
+            return msg;
+        }
+
+        // ── Request side: fix Caller Contact for INVITE ────────────────
         if let SipMessage::Request(ref mut req) = msg {
             let source_port = from.addr.port.map(|p| p.0);
             fix_nated_contact_in_request(req, source_port);
@@ -226,13 +322,22 @@ impl MessageInspector for NatInspector {
         // ── Response side: fix Callee Contact in 1xx/2xx ────────────────
         if let SipMessage::Response(ref mut resp) = msg {
             let kind = resp.status_code.kind();
-            let is_target_forming = matches!(
-                kind,
-                rsipstack::sip::StatusCodeKind::Provisional
-                    | rsipstack::sip::StatusCodeKind::Successful
-            );
+            // A REGISTER response's Contacts are our own bindings echoed
+            // back by the registrar, not the peer's address; rewriting them
+            // breaks matching our binding to read its granted expiration.
+            let is_register = resp
+                .cseq_header()
+                .ok()
+                .and_then(|cseq| cseq.method().ok())
+                == Some(rsipstack::sip::Method::Register);
+            let is_target_forming = !is_register
+                && matches!(
+                    kind,
+                    rsipstack::sip::StatusCodeKind::Provisional
+                        | rsipstack::sip::StatusCodeKind::Successful
+                );
 
-            if is_target_forming {
+            if is_target_forming && !NatInspector::has_route_set(&resp.headers) {
                 for header in resp.headers.iter_mut() {
                     if let rsipstack::sip::Header::Contact(contact) = header {
                         let mut val = contact.value().to_string();
@@ -252,6 +357,9 @@ impl MessageInspector for NatInspector {
 #[cfg(test)]
 mod tests {
     use super::NatInspector;
+    use crate::proxy::routing::TrunkConfig;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use rsipstack::sip::SipMessage;
     use rsipstack::sip::{HeadersExt, ToTypedHeader};
     use rsipstack::transaction::endpoint::MessageInspector;
@@ -293,7 +401,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let rewritten = NatInspector::new().after_received(msg, Some(&from));
+        let rewritten = NatInspector::default().after_received(msg, Some(&from));
         let text = rewritten.to_string();
         let contact_line = text
             .lines()
@@ -303,6 +411,158 @@ mod tests {
         assert_eq!(
             contact_line, "Contact: <sip:41111112222@198.51.100.24:15060>",
             "rewritten Contact header should not duplicate the header name"
+        );
+    }
+
+    #[test]
+    fn test_nat_fix_leaves_register_response_contacts_untouched() {
+        // A REGISTER 200 OK echoes our own (private) binding; rewriting it to
+        // the registrar's address would stop us finding our granted expires.
+        let raw = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.5:15060;rport=40000;received=198.51.100.9;branch=z9hG4bK-reg\r\n",
+            "From: <sip:trunkuser@203.0.113.52>;tag=a\r\n",
+            "To: <sip:trunkuser@203.0.113.52>;tag=b\r\n",
+            "Call-ID: reg-nat-test\r\n",
+            "CSeq: 2 REGISTER\r\n",
+            "Contact: <sip:trunkuser@10.0.0.5:15060>;expires=600\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n"
+        );
+        let msg = SipMessage::try_from(raw).unwrap();
+        let from: SipAddr = rsipstack::sip::HostWithPort::try_from("203.0.113.52:5060")
+            .unwrap()
+            .into();
+
+        let text = NatInspector::default()
+            .after_received(msg, Some(&from))
+            .to_string();
+        assert!(
+            text.contains("Contact: <sip:trunkuser@10.0.0.5:15060>;expires=600"),
+            "{text}"
+        );
+    }
+
+    fn carrier_trunks(nat_fix: Option<bool>) -> HashMap<String, TrunkConfig> {
+        HashMap::from([(
+            "carrier".to_string(),
+            TrunkConfig {
+                dest: "sip:203.0.113.52:5060".to_string(),
+                inbound_hosts: vec!["198.51.100.0/24".to_string()],
+                nat_fix,
+                ..Default::default()
+            },
+        )])
+    }
+
+    fn inspector_with_trunk(global: bool, trunk_nat_fix: Option<bool>) -> NatInspector {
+        let inspector = NatInspector::new(global);
+        inspector.update_trunks(&carrier_trunks(trunk_nat_fix));
+        inspector
+    }
+
+    fn fixed_invite_contact(inspector: &NatInspector, source: &str) -> String {
+        let msg = SipMessage::Request(nated_invite());
+        let from: SipAddr = rsipstack::sip::HostWithPort::try_from(source)
+            .unwrap()
+            .into();
+        let SipMessage::Request(req) = inspector.after_received(msg, Some(&from)) else {
+            panic!("expected request")
+        };
+        contact_line(&req)
+    }
+
+    #[test]
+    fn test_trunk_nat_fix_overrides_disabled_global() {
+        let inspector = inspector_with_trunk(false, Some(true));
+        // From the trunk's inbound_hosts: the trunk enables the fix.
+        assert_eq!(
+            fixed_invite_contact(&inspector, "198.51.100.24:15060"),
+            "Contact: <sip:41111112222@198.51.100.24:15060>"
+        );
+        // Any other source keeps the global (disabled) behaviour.
+        assert_eq!(
+            fixed_invite_contact(&inspector, "192.0.2.7:15060"),
+            "Contact: <sip:41111112222@10.10.10.10:15060>"
+        );
+    }
+
+    #[test]
+    fn test_trunk_nat_fix_overrides_enabled_global() {
+        let inspector = inspector_with_trunk(true, Some(false));
+        assert_eq!(
+            fixed_invite_contact(&inspector, "198.51.100.24:15060"),
+            "Contact: <sip:41111112222@10.10.10.10:15060>"
+        );
+        assert_eq!(
+            fixed_invite_contact(&inspector, "192.0.2.7:15060"),
+            "Contact: <sip:41111112222@198.51.100.24:15060>"
+        );
+    }
+
+    #[test]
+    fn test_trunk_nat_fix_override_matches_trunk_dest_responses() {
+        // A 200 OK from the trunk's dest (an outbound call) follows the trunk.
+        let inspector = inspector_with_trunk(true, Some(false));
+        let raw = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 198.51.100.24:15060;branch=z9hG4bK-out\r\n",
+            "Call-ID: out@test\r\n",
+            "From: <sip:alice@198.51.100.24>;tag=a\r\n",
+            "To: <sip:bob@203.0.113.52>;tag=b\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:bob@10.20.30.40:5060>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n"
+        );
+        let from: SipAddr = rsipstack::sip::HostWithPort::try_from("203.0.113.52:5060")
+            .unwrap()
+            .into();
+        let msg = SipMessage::try_from(raw).unwrap();
+        let text = inspector.after_received(msg, Some(&from)).to_string();
+        assert!(
+            text.contains("Contact: <sip:bob@10.20.30.40:5060>"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn test_trunk_without_nat_fix_follows_global() {
+        let inspector = inspector_with_trunk(false, None);
+        assert_eq!(
+            fixed_invite_contact(&inspector, "198.51.100.24:15060"),
+            "Contact: <sip:41111112222@10.10.10.10:15060>"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trunk_reload_updates_nat_exceptions() {
+        use crate::config::ProxyConfig;
+        use crate::proxy::data::ProxyDataContext;
+
+        let generated_dir = tempfile::tempdir().unwrap();
+        let mut config = ProxyConfig::default();
+        config.nat_fix = false;
+        config.acl_rules = None;
+        config.generated_dir = generated_dir.path().to_string_lossy().to_string();
+        config.trunks = carrier_trunks(Some(true));
+        let dc = ProxyDataContext::new(Arc::new(config.clone()), None)
+            .await
+            .unwrap();
+
+        let inspector = dc.nat_inspector().clone();
+        assert_eq!(
+            fixed_invite_contact(&inspector, "198.51.100.24:15060"),
+            "Contact: <sip:41111112222@198.51.100.24:15060>"
+        );
+
+        config.trunks = carrier_trunks(None);
+        dc.reload_trunks(false, Some(Arc::new(config)))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixed_invite_contact(&inspector, "198.51.100.24:15060"),
+            "Contact: <sip:41111112222@10.10.10.10:15060>"
         );
     }
 
@@ -335,6 +595,53 @@ mod tests {
     }
 
     #[test]
+    fn websocket_contacts_preserve_registration_identity() {
+        use rsipstack::sip::{Response, StatusCode, Transport, Version};
+
+        for transport in [
+            Transport::Ws,
+            Transport::Wss,
+            Transport::Udp,
+            Transport::Tcp,
+        ] {
+            let from = SipAddr {
+                r#type: Some(transport),
+                addr: "198.51.100.24:15060".try_into().unwrap(),
+            };
+            let mut request = nated_invite();
+            // The actual transport determines whether a Contact is rewritten;
+            // a peer-supplied transport parameter must not select this policy.
+            *request.contact_header_mut().unwrap() =
+                "<sip:41111112222@10.10.10.10:15060;transport=wss>".into();
+            let original = request.contact_header().unwrap().value().to_owned();
+            let response = Response {
+                version: Version::V2,
+                status_code: StatusCode::OK,
+                headers: request.headers.clone(),
+                body: vec![],
+                wire_reason: None,
+            };
+            for message in [SipMessage::Request(request), SipMessage::Response(response)] {
+                let inspected = NatInspector::new(true).after_received(message, Some(&from));
+                let contact = match &inspected {
+                    SipMessage::Request(request) => request.contact_header().unwrap(),
+                    SipMessage::Response(response) => response.contact_header().unwrap(),
+                };
+                let expected = if matches!(transport, Transport::Ws | Transport::Wss) {
+                    original.as_str()
+                } else {
+                    "<sip:41111112222@198.51.100.24:15060;transport=wss>"
+                };
+                assert_eq!(
+                    contact.value(),
+                    expected,
+                    "transport={transport}, message={inspected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_fix_nated_contact_invite_rewrites_private_contact() {
         let mut req = nated_invite();
         assert!(super::fix_nated_contact_in_request(&mut req, None));
@@ -345,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_nated_contact_register_rewrites_private_contact() {
+    fn test_fix_nated_contact_register_preserves_binding_identity() {
         let raw = concat!(
             "REGISTER sip:rustpbx.com SIP/2.0\r\n",
             "Via: SIP/2.0/UDP 192.168.1.50:5060;rport=60780;received=203.0.113.9;branch=z9hG4bKreg1\r\n",
@@ -362,10 +669,10 @@ mod tests {
         else {
             panic!("expected request")
         };
-        assert!(super::fix_nated_contact_in_request(&mut req, None));
+        assert!(!super::fix_nated_contact_in_request(&mut req, None));
         assert_eq!(
             contact_line(&req),
-            "Contact: <sip:1001@203.0.113.9:60780;transport=udp>;expires=3600"
+            "Contact: <sip:1001@192.168.1.50:5060;transport=udp>;expires=3600"
         );
     }
 
@@ -482,6 +789,76 @@ mod tests {
         assert_eq!(
             contact_line(&req),
             "Contact: <sip:41111112222@10.10.10.10:15060>"
+        );
+    }
+
+    /// A Record-Route/Route set pins the dialog path — the peer's last-hop
+    /// proxy can reach its own private Contact, so the fix is skipped even
+    /// though the Via carries the received/rport NAT signal.
+    #[test]
+    fn test_fix_nated_contact_record_route_pins_dialog_path() {
+        for extra in [
+            "Record-Route: <sip:sbc.carrier.example;lr>\r\n",
+            "Route: <sip:upstream.carrier.example;lr>\r\n",
+        ] {
+            let raw = format!(
+                concat!(
+                    "INVITE sip:79900123456@203.0.113.52 SIP/2.0\r\n",
+                    "Via: SIP/2.0/UDP 10.10.10.10:15060;rport=15060;received=198.51.100.24;branch=z9hG4bKrr\r\n",
+                    "Call-ID: rr@voltecall\r\n",
+                    "From: <sip:41111112222@10.10.10.10>;tag=aTNjBN8v\r\n",
+                    "To: <sip:79900123456@203.0.113.52>\r\n",
+                    "CSeq: 7 INVITE\r\n",
+                    "{}",
+                    "Contact: <sip:41111112222@10.10.10.10:15060>\r\n",
+                    "Content-Length: 0\r\n",
+                    "\r\n"
+                ),
+                extra
+            );
+            let rsipstack::sip::SipMessage::Request(mut req) =
+                rsipstack::sip::SipMessage::try_from(raw).unwrap()
+            else {
+                panic!("expected request")
+            };
+            assert!(
+                !super::fix_nated_contact_in_request(&mut req, None),
+                "extra header {extra} should pin the dialog path"
+            );
+            assert_eq!(
+                contact_line(&req),
+                "Contact: <sip:41111112222@10.10.10.10:15060>"
+            );
+        }
+    }
+
+    /// Same on the response side: a 200 OK carrying Record-Route keeps its
+    /// private Contact (normally rewritten to the observed source address).
+    #[test]
+    fn test_nat_fix_leaves_response_with_record_route_untouched() {
+        let raw = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 198.51.100.24:15060;rport=15060;received=198.51.100.24;branch=z9hG4bKrrresp\r\n",
+            "Call-ID: rr-resp@voltecall\r\n",
+            "From: <sip:alice@198.51.100.23>;tag=aTNjBN8v\r\n",
+            "To: <sip:79900123456@203.0.113.52>;tag=df598941\r\n",
+            "CSeq: 7 INVITE\r\n",
+            "Record-Route: <sip:sbc.carrier.example;lr>\r\n",
+            "Contact: <sip:41111112222@10.10.10.10:15060>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n"
+        );
+        let msg = SipMessage::try_from(raw).unwrap();
+        let from: SipAddr = rsipstack::sip::HostWithPort::try_from("198.51.100.24:15060")
+            .unwrap()
+            .into();
+
+        let text = NatInspector::default()
+            .after_received(msg, Some(&from))
+            .to_string();
+        assert!(
+            text.contains("Contact: <sip:41111112222@10.10.10.10:15060>"),
+            "{text}"
         );
     }
 }

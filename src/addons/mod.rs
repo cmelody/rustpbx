@@ -200,6 +200,18 @@ pub trait Addon: Send + Sync {
         None
     }
 
+    /// Override the built-in WebRTC ICE servers endpoint (browser discovery of
+    /// STUN/TURN configuration, including short-lived TURN REST credentials).
+    ///
+    /// The returned router must register exactly one path, taken from
+    /// `[proxy].ice_servers_path` (default [`crate::config::DEFAULT_ICE_SERVERS_PATH`]).
+    /// When an override exists, core's own static-config handler is skipped
+    /// for that path; the override handler decides its own fallback behavior.
+    /// Only the first non-None result across all enabled addons is used.
+    fn ice_servers_route(&self, _state: AppState) -> Option<Router> {
+        None
+    }
+
     /// Return Sidebar menu items
     fn sidebar_items(&self, _state: AppState) -> Vec<SidebarItem> {
         vec![]
@@ -208,11 +220,6 @@ pub trait Addon: Send + Sync {
     /// Return the configuration URL for the addon
     fn config_url(&self, state: AppState) -> Option<String> {
         self.sidebar_items(state).first().map(|s| s.url.clone())
-    }
-
-    /// Return Settings page injection items (HTML fragments or config definitions)
-    fn settings_items(&self) -> Option<String> {
-        None
     }
 
     /// Return scripts to be injected into specific pages
@@ -241,6 +248,13 @@ pub trait Addon: Send + Sync {
     /// source-tree layout at runtime) can point at their own assets.
     fn template_dir(&self) -> Option<String> {
         None
+    }
+
+    /// Whether this addon renders console pages and so needs a template
+    /// directory. Addons serving only plain endpoints (e.g. metrics) return
+    /// false to stay out of the missing-templates startup check.
+    fn has_console_pages(&self) -> bool {
+        true
     }
 
     /// Directory with static assets served under `/static/<addon_id>/`.
@@ -285,6 +299,19 @@ pub trait Addon: Send + Sync {
         &self,
     ) -> Option<Arc<dyn crate::proxy::call::QueueLocationEnricher>> {
         None
+    }
+
+    /// Update the priority of the call's unclaimed shared-queue row in the
+    /// addon-owned table. RWI `queue.set_priority` dispatches here so core
+    /// never names the owning addon; the caller gates on the gateway's
+    /// injected shared-queue DB. Return `true` when a row was updated.
+    async fn shared_queue_update_priority(
+        &self,
+        _db: &sea_orm::DatabaseConnection,
+        _call_id: &str,
+        _priority: i32,
+    ) -> bool {
+        false
     }
 
     /// Shutdown the addon, releasing any resources (background tasks, connections, etc.).
@@ -346,6 +373,19 @@ pub trait Addon: Send + Sync {
     /// Addons should apply their own middleware layers as needed.
     #[cfg(feature = "console")]
     fn console_api_routes(&self, _state: &ConsoleState) -> Option<Router<Arc<ConsoleState>>> {
+        None
+    }
+
+    /// Return console API routes that must stay reachable WITHOUT
+    /// authentication (e.g. desktop update-client checks and telemetry
+    /// ingestion). Merged under the api prefix but OUTSIDE the
+    /// api_auth_middleware / csrf_guard layers, so each addon owns its own
+    /// abuse protection on these routes (body limits, rate limiting).
+    #[cfg(feature = "console")]
+    fn console_public_api_routes(
+        &self,
+        _state: &ConsoleState,
+    ) -> Option<Router<Arc<ConsoleState>>> {
         None
     }
 

@@ -27,11 +27,48 @@ mod tests {
         }
     }
 
+    /// Trunk registry holding `trunks`.
+    async fn data_context(
+        trunks: std::collections::HashMap<String, rustpbx::proxy::routing::TrunkConfig>,
+    ) -> Arc<rustpbx::proxy::data::ProxyDataContext> {
+        let config = rustpbx::config::ProxyConfig { trunks, ..Default::default() };
+        Arc::new(
+            rustpbx::proxy::data::ProxyDataContext::new(Arc::new(config), None)
+                .await
+                .unwrap(),
+        )
+    }
+
     /// Resolve a routing decision for a synthetic INVITE against a stub
     /// route server that always replies with `response`.
     async fn resolve_with_response(
         response: serde_json::Value,
     ) -> Result<rustpbx::call::Dialplan, rustpbx::proxy::call::RouteError> {
+        resolve_with_trunks(response, Default::default()).await
+    }
+
+    /// As [`resolve_with_response`], with `trunks` configured.
+    async fn resolve_with_trunks(
+        response: serde_json::Value,
+        trunks: std::collections::HashMap<String, rustpbx::proxy::routing::TrunkConfig>,
+    ) -> Result<rustpbx::call::Dialplan, rustpbx::proxy::call::RouteError> {
+        resolve_inbound(response, trunks, None).await
+    }
+
+    /// As [`resolve_with_trunks`], for a call that arrived on `source_trunk`.
+    async fn resolve_inbound(
+        response: serde_json::Value,
+        trunks: std::collections::HashMap<String, rustpbx::proxy::routing::TrunkConfig>,
+        source_trunk: Option<&str>,
+    ) -> Result<rustpbx::call::Dialplan, rustpbx::proxy::call::RouteError> {
+        let cookie = TransactionCookie::default();
+        if let Some(name) = source_trunk {
+            cookie.insert_extension(rustpbx::call::TrunkContext {
+                id: None,
+                name: name.to_string(),
+                did_numbers: Vec::new(),
+            });
+        }
         let app = Router::new().route(
             "/route",
             post(move || async move { Json(response.clone()) }),
@@ -54,6 +91,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(trunks).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -79,9 +117,87 @@ mod tests {
                 &request,
                 Box::new(StubRouteInvite),
                 &caller,
-                &TransactionCookie::default(),
+                &cookie,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn test_http_router_per_target_retry_policy_and_legacy_compatibility() {
+        let plan = resolve_with_response(json!({
+            "action": "forward",
+            "targets": [
+                "sip:first@example.com",
+                {"uri": "sip:second@example.com", "retry_policy": {"status_codes": [408, 503]}},
+                {"uri": "sip:last@example.com", "retry_policy": {"status_codes": []}}
+            ]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0].location.aor.to_string(), "sip:first@example.com");
+        assert_eq!(attempts[1].location.aor.to_string(), "sip:second@example.com");
+        assert!(attempts[0].retry_policy.is_none());
+        assert_eq!(attempts[1].retry_policy.as_ref().unwrap().status_codes, vec![408, 503]);
+        assert!(attempts[2].retry_policy.as_ref().unwrap().status_codes.is_empty());
+
+        let legacy = resolve_with_response(json!({
+            "action": "forward", "targets": ["sip:first@example.com", {"uri": "sip:last@example.com"}]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = legacy.flow else {
+            panic!("expected sequential targets");
+        };
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| attempt.retry_policy.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_http_router_legacy_targets_skip_invalid_uri() {
+        let plan = resolve_with_response(json!({
+            "action": "forward",
+            "targets": ["sip:first@example.com", "", "sip:last@example.com"]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1].location.aor.to_string(), "sip:last@example.com");
+        assert!(attempts.iter().all(|attempt| attempt.retry_policy.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_http_router_rtp_override_and_parallel_targets() {
+        let plan = resolve_with_response(json!({
+            "action": "forward", "strategy": "parallel",
+            "targets": ["sip:first@example.com", {"uri": "sip:last@example.com"}],
+            "media_proxy": "all",
+            "rtp_config": {"bind_ip": "127.0.0.2", "external_ip": "2001:db8::1"}
+        })).await.unwrap();
+        assert_eq!(plan.media.bind_ip.as_deref(), Some("127.0.0.2"));
+        assert_eq!(plan.media.external_ip.as_deref(), Some("2001:db8::1"));
+        assert!(plan.media.enable_latching);
+        assert_eq!(plan.media.proxy_mode, MediaProxyMode::All);
+        let DialplanFlow::Targets(DialStrategy::Parallel(targets)) = plan.flow else {
+            panic!("expected parallel targets");
+        };
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_http_router_rejects_invalid_retry_and_rtp_config() {
+        for fields in [
+            json!({"targets": [{"uri": "sip:test@example.com", "retry_policy": {"status_codes": [200]}}]}),
+            json!({"targets": [{"uri": "sip:test@example.com", "retry_policy": {"status_codes": [700]}}]}),
+            json!({"rtp_config": {"bind_ip": "invalid-ip"}}),
+            json!({"rtp_config": {"external_ip": "invalid-ip"}}),
+            json!({"rtp_config": {"bind_ip_typo": "127.0.0.2"}}),
+        ] {
+            let mut response = json!({"action": "forward", "targets": ["sip:test@example.com"]});
+            response.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            let error = resolve_with_response(response).await.err().expect("invalid config must fail");
+            assert_eq!(error.status, Some(rsipstack::sip::StatusCode::ServerInternalError));
+        }
     }
 
     #[tokio::test]
@@ -125,6 +241,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -220,6 +337,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -385,6 +503,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -488,6 +607,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -583,6 +703,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -665,6 +786,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -759,6 +881,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -837,7 +960,8 @@ mod tests {
                 Json(json!({
                     "action": "forward",
                     "targets": ["sip:1001@127.0.0.1"],
-                    "media_proxy": "all"
+                    "media_proxy": "all",
+                    "rtp_config": {"bind_ip": "127.0.0.2"}
                 }))
             }),
         );
@@ -858,6 +982,7 @@ mod tests {
 
         let rtp_config = RtpConfig {
             external_ip: Some("203.0.113.1".to_string()),
+            bind_ip: Some("127.0.0.1".to_string()),
             start_port: Some(10000),
             end_port: Some(20000),
             ..Default::default()
@@ -869,6 +994,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -914,7 +1040,8 @@ mod tests {
             dialplan.media.proxy_mode,
             rustpbx::config::MediaProxyMode::All
         );
-        // Verify RTP config from server is applied
+        assert_eq!(dialplan.media.bind_ip.as_deref(), Some("127.0.0.2"));
+        // Omitted RTP fields still inherit server settings
         assert_eq!(dialplan.media.external_ip.as_deref(), Some("203.0.113.1"));
         assert_eq!(dialplan.media.rtp_start_port, Some(10000));
         assert_eq!(dialplan.media.rtp_end_port, Some(20000));
@@ -957,6 +1084,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -1057,6 +1185,7 @@ mod tests {
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+            data_context(Default::default()).await,
         );
 
         let request = rsipstack::sip::Request {
@@ -1091,9 +1220,13 @@ mod tests {
             .await
             .unwrap();
 
+        let rule = dialplan
+            .header_passthrough
+            .as_ref()
+            .expect("with_original_headers=false must be an explicit rule");
         assert!(
-            dialplan.header_passthrough.is_none(),
-            "with_original_headers=false must map to no passthrough"
+            !rule.allows("X-Smart2Agent"),
+            "with_original_headers=false must forward no custom headers"
         );
     }
 
@@ -1148,5 +1281,188 @@ mod tests {
             err.status.is_some(),
             "an invalid caller override must carry a SIP error status"
         );
+    }
+
+    fn trunk(dest: &str, retry_codes: Option<Vec<u16>>) -> rustpbx::proxy::routing::TrunkConfig {
+        rustpbx::proxy::routing::TrunkConfig {
+            dest: dest.to_string(),
+            username: Some("acct".to_string()),
+            password: Some("secret".to_string()),
+            max_ring_time: Some(20),
+            retry_policy: retry_codes
+                .map(|status_codes| rustpbx::proxy::routing::RetryPolicy { status_codes }),
+            ..Default::default()
+        }
+    }
+
+    fn outbound_trunk(attempt: &rustpbx::call::DialAttempt) -> String {
+        attempt
+            .hints
+            .as_ref()
+            .and_then(|hints| hints.extensions.get::<rustpbx::call::OutboundTrunkContext>())
+            .map(|ctx| ctx.name.clone())
+            .expect("trunk attempt must carry its outbound trunk")
+    }
+
+    #[tokio::test]
+    async fn test_http_router_trunk_targets_inherit_trunk_config_and_retry() {
+        let trunks = [
+            ("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", Some(vec![408, 503]))),
+            ("carrier-b".to_string(), trunk("sip:10.0.0.2:5080", None)),
+        ]
+        .into();
+        let plan = resolve_with_trunks(json!({
+            "action": "forward",
+            "caller": "sip:cli@example.com",
+            "targets": [
+                {"trunk": "carrier-a"},
+                {"trunk": "carrier-b", "callee": "8613800000000"},
+                {"trunk": "carrier-b", "retry_policy": {"status_codes": [486]}},
+                "sip:legacy@example.com"
+            ]
+        }), trunks).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        assert_eq!(attempts.len(), 4);
+
+        // Callee defaults to the dialed user, qualified with the trunk's host;
+        // destination and credentials come from the trunk.
+        assert_eq!(attempts[0].location.aor.to_string(), "sip:target@10.0.0.1:5060");
+        assert_eq!(attempts[0].location.destination.as_ref().unwrap().addr.to_string(), "10.0.0.1:5060");
+        assert_eq!(attempts[0].location.credential.as_ref().unwrap().username, "acct");
+        assert_eq!(attempts[1].location.aor.to_string(), "sip:8613800000000@10.0.0.2:5080");
+        assert_eq!(outbound_trunk(&attempts[0]), "carrier-a");
+        assert_eq!(outbound_trunk(&attempts[1]), "carrier-b");
+        assert_eq!(
+            attempts[0].hints.as_ref().unwrap().max_ring_time,
+            Some(std::time::Duration::from_secs(20))
+        );
+        // The response's caller override is the trunk attempt's caller, with
+        // the trunk's host rewrite applied.
+        assert_eq!(attempts[0].caller.as_ref().unwrap().to_string(), "sip:cli@10.0.0.1:5060");
+
+        // Retry: the trunk's policy, an empty one when it has none, or the
+        // target's own override; plain URIs keep legacy advance-on-failure.
+        assert_eq!(attempts[0].retry_policy.as_ref().unwrap().status_codes, vec![408, 503]);
+        assert!(attempts[1].retry_policy.as_ref().unwrap().status_codes.is_empty());
+        assert_eq!(attempts[2].retry_policy.as_ref().unwrap().status_codes, vec![486]);
+        assert!(attempts[3].retry_policy.is_none());
+        // Ring time limits each attempt in a sequence, not the call.
+        assert_eq!(plan.max_ring_time, None);
+    }
+
+    #[tokio::test]
+    async fn test_http_router_single_trunk_target_ring_time_limits_call() {
+        let trunks = [("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", None))].into();
+        let plan = resolve_with_trunks(
+            json!({"action": "forward", "targets": [{"trunk": "carrier-a"}]}),
+            trunks,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.max_ring_time, Some(std::time::Duration::from_secs(20)));
+    }
+
+    #[tokio::test]
+    async fn test_http_router_rejects_bad_trunk_targets() {
+        let mut disabled = trunk("sip:10.0.0.3", None);
+        disabled.disabled = Some(true);
+        let trunks: std::collections::HashMap<_, _> = [
+            ("carrier-a".to_string(), trunk("sip:10.0.0.1", None)),
+            ("off".to_string(), disabled),
+        ]
+        .into();
+        for target in [
+            json!({"trunk": "missing"}),
+            json!({"trunk": "off"}),
+            json!({"trunk": "carrier-a", "uri": "sip:x@example.com"}),
+            json!({"trunk": "carrier-a", "retry_policy": {"status_codes": [200]}}),
+        ] {
+            let result = resolve_with_trunks(
+                json!({"action": "forward", "targets": [target.clone()]}),
+                trunks.clone(),
+            )
+            .await;
+            assert!(result.is_err(), "{target} must fail the call");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_router_arrival_trunk_network_path_under_target_trunk() {
+        let mut arrival = trunk("sip:192.0.2.9", None);
+        arrival.profile = Some("arrival".to_string());
+        arrival.external_ip = Some("198.51.100.1".to_string());
+        arrival.codec = vec!["pcma".to_string()];
+        let mut own = trunk("sip:10.0.0.2", None);
+        own.profile = Some("dest".to_string());
+        let trunks = [
+            ("carrier-in".to_string(), arrival),
+            ("own-profile".to_string(), own),
+            ("no-profile".to_string(), trunk("sip:10.0.0.3", None)),
+        ]
+        .into();
+        let plan = resolve_inbound(json!({
+            "action": "forward",
+            "targets": [
+                "sip:legacy@example.com",
+                {"trunk": "own-profile"},
+                {"trunk": "no-profile"}
+            ]
+        }), trunks, Some("carrier-in")).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        let hints = |i: usize| attempts[i].hints.as_ref().expect("attempt hints");
+        // A URI target dials with the arrival trunk's network path only.
+        assert_eq!(hints(0).network_profile_id.as_deref(), Some("arrival"));
+        assert_eq!(hints(0).external_ip.as_deref(), Some("198.51.100.1"));
+        assert!(hints(0).allow_codecs.is_none());
+        // A target trunk's own profile wins; without one the arrival's applies.
+        assert_eq!(hints(1).network_profile_id.as_deref(), Some("dest"));
+        assert_eq!(hints(2).network_profile_id.as_deref(), Some("arrival"));
+        assert_eq!(outbound_trunk(&attempts[2]), "no-profile");
+
+        // Without an arrival trunk, URI targets carry no hints.
+        let internal = resolve_with_response(json!({
+            "action": "forward", "targets": ["sip:legacy@example.com"]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = internal.flow else {
+            panic!("expected sequential targets");
+        };
+        assert!(attempts[0].hints.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_router_rtp_config_beats_trunk_network_path() {
+        let mut arrival = trunk("sip:192.0.2.9", None);
+        arrival.profile = Some("arrival".to_string());
+        arrival.external_ip = Some("198.51.100.1".to_string());
+        let mut own = trunk("sip:10.0.0.2", None);
+        own.profile = Some("dest".to_string());
+        own.bind_ip = Some("10.0.0.99".to_string());
+        let trunks = [
+            ("carrier-in".to_string(), arrival),
+            ("own-profile".to_string(), own),
+        ]
+        .into();
+        let plan = resolve_inbound(json!({
+            "action": "forward",
+            "targets": ["sip:legacy@example.com", {"trunk": "own-profile"}],
+            "rtp_config": {"bind_ip": "127.0.0.1", "external_ip": "203.0.113.7"}
+        }), trunks, Some("carrier-in")).await.unwrap();
+        assert_eq!(plan.media.bind_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(plan.media.external_ip.as_deref(), Some("203.0.113.7"));
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        for attempt in &attempts {
+            let hints = attempt.hints.as_ref().expect("attempt hints");
+            assert_eq!(hints.bind_ip.as_deref(), Some("127.0.0.1"));
+            assert_eq!(hints.external_ip.as_deref(), Some("203.0.113.7"));
+        }
+        // Profiles still apply underneath (ports, SIP Contact).
+        assert_eq!(attempts[0].hints.as_ref().unwrap().network_profile_id.as_deref(), Some("arrival"));
+        assert_eq!(attempts[1].hints.as_ref().unwrap().network_profile_id.as_deref(), Some("dest"));
     }
 }

@@ -30,7 +30,8 @@ use tracing_subscriber::{
 /// Same behaviour as AMI `POST /shutdown`: `docker stop` /
 /// `systemctl stop` and the HTTP endpoint are interchangeable. The
 /// drain timeout comes from `[graceful_shutdown].drain_timeout_secs`
-/// (default 300s, 0 = wait forever).
+/// (default 3600s, 0 = wait forever).
+
 pub async fn drain_and_stop(state: &crate::app::AppState) {
     let first = crate::shutdown::initiate();
     let timeout = state.config().graceful_shutdown_timeout();
@@ -170,6 +171,15 @@ impl AppBuilder {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build media runtime: {}", e))?;
         crate::utils::set_media_runtime(media_runtime.handle().clone());
+
+        // Rolling handover runtime: created ONCE before the retry loop
+        // (recreating per attempt would stack hello pingers). Shared by
+        // successor (waiting/serving) and predecessor (handover + window).
+        let rolling: Option<Arc<crate::rolling::RollingRuntime>> = config
+            .rolling
+            .clone()
+            .filter(|r| r.enabled)
+            .map(|cfg| crate::rolling::RollingRuntime::new(cfg, &config.http_addr));
         // Recorder tasks wake per captured RTP packet; keep them off the small
         // SIP runtime so high-concurrency recording cannot starve SIP timers.
         crate::media::media_recorder::set_recorder_runtime(media_runtime.handle().clone());
@@ -280,9 +290,7 @@ impl AppBuilder {
             let (filter_layer, filter_handle) = log_reload::ReloadableFilterLayer::new(env_filter);
             log_reload::set_log_filter_handle(filter_handle);
 
-            let tokio_console_enabled = cli.tokio_console.is_some()
-                || std::env::var_os("TOKIO_CONSOLE").is_some()
-                || std::env::var_os("TOKIO_CONSOLE_BIND").is_some();
+            let tokio_console_enabled = cli.tokio_console.is_some();
             let mut console_layer = None;
             if tokio_console_enabled {
                 use console_subscriber::ServerAddr;
@@ -429,11 +437,42 @@ impl AppBuilder {
                 if cli.skip_migrate {
                     state_builder = state_builder.with_skip_migrate();
                 }
+                // Rolling handover runtime: created ONCE before the retry
+                // loop (recreating per attempt would stack hello pingers).
+                // Shared by successor (waiting/serving) and predecessor
+                // (handover + window).
+                state_builder.rolling = rolling.clone();
 
                 let (app_reload_requested, app_config_path) = {
                     let state = match state_builder.build().await {
                         Ok(state) => state,
                         Err(err) => {
+                            // Rolling successor waiting for the predecessor
+                            // to release the ports: park on a fast retry
+                            // WITHOUT burning the general retry budget (the
+                            // wait is unbounded by design; hello keeps the
+                            // predecessor convinced this process is ready).
+                            let err_msg = format!("{err:#}");
+                            if rolling.is_some()
+                                && (err_msg.contains("Failed to bind")
+                                    || err_msg.contains("Address already in use"))
+                            {
+                                if retry_count == 0 {
+                                    info!(
+                                        "rolling: waiting for predecessor to release the SIP ports"
+                                    );
+                                }
+                                if retry_count % 50 == 0 && retry_count > 0 {
+                                    info!(
+                                        waited_s = retry_count / 5,
+                                        "rolling: still waiting for the SIP ports"
+                                    );
+                                }
+                                retry_count += 1;
+                                sleep(Duration::from_millis(200)).await;
+                                cached_config = Some(config);
+                                continue;
+                            }
                             retry_count += 1;
                             if retry_count > max_retries {
                                 return Err(anyhow::anyhow!(
@@ -454,6 +493,13 @@ impl AppBuilder {
                             continue;
                         }
                     };
+
+                    // Rolling: wire the local dialog registry into the UDP
+                    // pump and start hello-pinging the predecessor.
+                    if let Some(ref rolling) = rolling {
+                        rolling.attach_sip_server(state.sip_server().inner.clone());
+                        rolling.start_hello_pinger();
+                    }
 
                     // Auto-create demo superuser when demo_mode is enabled.
                     // Loud warning: the credentials are public knowledge.
@@ -492,7 +538,7 @@ impl AppBuilder {
 
                     info!("starting rustpbx on {}", state.config().http_addr);
                     let router = create_router(state.clone());
-                    let mut app_future = Box::pin(crate::app::run(state.clone(), router));
+                    let mut app_future = Box::pin(crate::app::run(state.clone(), router.clone()));
 
                     #[cfg(unix)]
                     let mut sigterm_stream = {
@@ -520,8 +566,13 @@ impl AppBuilder {
                                 let _ = app_future.await;
                             }
                             _ = sigterm_stream.recv() => {
-                                info!("received SIGTERM, initiating graceful drain");
-                                drain_and_stop(&state).await;
+                                if let Some(ref rolling) = rolling {
+                                    info!("received SIGTERM — rolling handover path");
+                                    rolling.handle_termination(&state, router).await;
+                                } else {
+                                    info!("received SIGTERM, initiating graceful drain");
+                                    drain_and_stop(&state).await;
+                                }
                                 let _ = app_future.await;
                             }
                         }
@@ -715,3 +766,4 @@ async fn dump_ddl(
 
     Ok(())
 }
+

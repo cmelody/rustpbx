@@ -1,6 +1,53 @@
 use audio_codec::CodecType;
-use rustrtc::{Attribute, MediaKind, SdpType, SessionDescription, TransportMode};
+use rustrtc::{
+    Attribute, Connectivity, Keying, MediaKind, RtcConfiguration, SdpType, SessionDescription,
+};
 use std::collections::{HashMap, HashSet};
+
+/// The kind of media transport of a leg. rustrtc configures it with
+/// `connectivity` and `keying`: see [`TransportMode::rtc_configuration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportMode {
+    /// A WebRTC peer: full ICE, DTLS-SRTP.
+    WebRtc,
+    /// A SIP peer with SDES-SRTP (`a=crypto`, RTP/SAVP).
+    Srtp,
+    /// A SIP peer with plain RTP (RTP/AVP).
+    Rtp,
+}
+
+impl TransportMode {
+    /// The mode of a peer connection, from its keying.
+    pub fn of(config: &RtcConfiguration) -> Self {
+        match config.keying {
+            Keying::Dtls => TransportMode::WebRtc,
+            Keying::Sdes => TransportMode::Srtp,
+            Keying::None => TransportMode::Rtp,
+        }
+    }
+
+    /// The rustrtc configuration for a peer of this kind. `ice_lite` makes
+    /// RTP and SRTP legs ICE-lite agents; WebRTC legs always run full ICE.
+    pub fn rtc_configuration(&self, ice_lite: bool) -> RtcConfiguration {
+        let connectivity = if ice_lite {
+            Connectivity::IceLite
+        } else {
+            Connectivity::Sdp
+        };
+        match self {
+            TransportMode::WebRtc => RtcConfiguration::webrtc(),
+            TransportMode::Srtp => RtcConfiguration {
+                connectivity,
+                keying: Keying::Sdes,
+                ..RtcConfiguration::sip()
+            },
+            TransportMode::Rtp => RtcConfiguration {
+                connectivity,
+                ..RtcConfiguration::sip()
+            },
+        }
+    }
+}
 
 /// Detect the transport mode implied by an SDP body.
 ///
@@ -9,7 +56,7 @@ use std::collections::{HashMap, HashSet};
 /// - otherwise → Rtp (plain `RTP/AVP`)
 ///
 /// Used by [`crate::leg::Leg`] construction to pick the right
-/// `RtcConfiguration.transport_mode` before the PeerConnection is created.
+/// [`TransportMode`] before the PeerConnection is created.
 pub fn detect_transport(sdp: &str) -> TransportMode {
     if sdp.contains("a=fingerprint") || sdp.contains("a=setup:") {
         TransportMode::WebRtc
@@ -154,7 +201,7 @@ pub struct NegotiatedLegProfile {
     /// ingress tap must listen on every one of these.
     pub dtmf_pts: Vec<u8>,
     /// Transport mode for this leg (RTP or WebRTC/SRTP).
-    pub transport: rustrtc::TransportMode,
+    pub transport: TransportMode,
 }
 
 impl Default for NegotiatedLegProfile {
@@ -164,7 +211,7 @@ impl Default for NegotiatedLegProfile {
             video: Vec::new(),
             dtmf: None,
             dtmf_pts: Vec::new(),
-            transport: rustrtc::TransportMode::Rtp,
+            transport: TransportMode::Rtp,
         }
     }
 }
@@ -514,7 +561,7 @@ impl MediaNegotiator {
             video,
             dtmf,
             dtmf_pts: extracted.dtmf.iter().map(|c| c.payload_type).collect(),
-            transport: rustrtc::TransportMode::Rtp,
+            transport: TransportMode::Rtp,
         }
     }
 
@@ -585,7 +632,10 @@ impl MediaNegotiator {
                 clock_rate: c.clock_rate,
                 fmtp: c.fmtp.clone(),
                 rtcp_fbs: c.rtcp_fbs.clone(),
-                rtx_payload_type: None,
+                // Keep the RTX association: browsers pair NACK retransmission
+                // with the `apt` payload type, and dropping it silently
+                // disables loss recovery on every relayed video leg.
+                rtx_payload_type: c.rtx_payload_type,
             });
         }
         caps
@@ -643,12 +693,31 @@ impl MediaNegotiator {
     ) -> anyhow::Result<()> {
         let mut used_payload_types: HashSet<u8> = occupied_payload_types.into_iter().collect();
         for cap in caps {
+            // Primary payload type first. RTX PTs are reserved alongside so
+            // a remapped primary can never land on another codec's rtx slot.
             if used_payload_types.contains(&cap.payload_type) {
                 cap.payload_type = (96..=127)
                     .find(|payload_type| !used_payload_types.contains(payload_type))
                     .ok_or_else(|| anyhow::anyhow!("no free dynamic video payload type"))?;
             }
             used_payload_types.insert(cap.payload_type);
+            // The rtx association follows its primary: when the primary moved
+            // (or the old rtx PT collides with an occupied slot), re-seat the
+            // rtx PT too — the `apt=` fmtp is regenerated from it on rewrite.
+            if let Some(rtx) = cap.rtx_payload_type {
+                if used_payload_types.contains(&rtx) {
+                    cap.rtx_payload_type = Some(
+                        (96..=127)
+                            .find(|payload_type| !used_payload_types.contains(payload_type))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("no free dynamic video payload type")
+                            })?,
+                    );
+                }
+                if let Some(rtx) = cap.rtx_payload_type {
+                    used_payload_types.insert(rtx);
+                }
+            }
         }
         Ok(())
     }
@@ -666,6 +735,14 @@ impl MediaNegotiator {
     ) -> anyhow::Result<String> {
         let mut desc = SessionDescription::parse(sdp_type, sdp)
             .map_err(|error| anyhow::anyhow!("failed to parse SDP: {error}"))?;
+        // The session's own mux posture, captured before the mutable video
+        // borrow: BUNDLE grouping, or any audio m-line with `a=rtcp-mux`.
+        let session_mux_posture = desc.session.attributes.iter().any(|a| {
+            a.key == "group" && a.value.as_deref().is_some_and(|v| v.starts_with("BUNDLE"))
+        }) || desc.media_sections.iter().any(|section| {
+            section.kind == rustrtc::MediaKind::Audio
+                && section.attributes.iter().any(|a| a.key == "rtcp-mux")
+        });
         if let Some(video_section) = desc
             .media_sections
             .iter_mut()
@@ -686,6 +763,33 @@ impl MediaNegotiator {
             video_section
                 .attributes
                 .retain(|attr| !matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb"));
+
+            // rustrtc renders freshly added video transceivers as `m=video 0`
+            // without `a=rtcp-mux` — even under `RtcpMuxPolicy::Require` —
+            // while the audio m-line carries mux attributes and BUNDLE groups
+            // both m-lines. A BUNDLE member without rtcp-mux is rejected by
+            // browsers on setLocalDescription (`rtcp-mux must be enabled when
+            // BUNDLE is enabled` → JsSIP answers 500). When the session's own
+            // mux posture says BUNDLE/mux, restore the video m-line to an
+            // answerable state: a real port placeholder and `a=rtcp-mux`.
+            // Plain-RTP sessions without mux are left untouched.
+            if session_mux_posture {
+                if video_section.port == 0 {
+                    // SDP placeholder port for ICE-managed media (RFC 3264
+                    // §6; the real transport comes from ICE candidates).
+                    video_section.port = 9;
+                }
+                if !video_section
+                    .attributes
+                    .iter()
+                    .any(|attr| attr.key == "rtcp-mux")
+                {
+                    video_section
+                        .attributes
+                        .push(Attribute::new("rtcp-mux", None));
+                }
+            }
+
             for cap in ordered_caps {
                 video_section.attributes.push(Attribute::new(
                     "rtpmap",
@@ -704,6 +808,21 @@ impl MediaNegotiator {
                     video_section.attributes.push(Attribute::new(
                         "rtcp-fb",
                         Some(format!("{} {}", cap.payload_type, feedback)),
+                    ));
+                }
+                // RTX retransmission association (RFC 4588): the rtx PT rides
+                // the m-line and points at its primary via `apt=`. Without
+                // it browsers cannot retransmit lost packets after NACK,
+                // leaving visible corruption until the next keyframe.
+                if let Some(rtx_pt) = cap.rtx_payload_type {
+                    video_section.formats.push(rtx_pt.to_string());
+                    video_section.attributes.push(Attribute::new(
+                        "rtpmap",
+                        Some(format!("{} rtx/{}", rtx_pt, cap.clock_rate)),
+                    ));
+                    video_section.attributes.push(Attribute::new(
+                        "fmtp",
+                        Some(format!("{} apt={}", rtx_pt, cap.payload_type)),
                     ));
                 }
             }
@@ -762,15 +881,25 @@ impl MediaNegotiator {
         result
     }
 
-    /// Remove codecs that should not be advertised in generated WebRTC offers.
+    /// Normalize a generated WebRTC offer's codec list.
     ///
-    /// If filtering removes every audio codec, fall back to the WebRTC default
-    /// offer set so the generated SDP does not contain a DTMF-only audio m-line.
+    /// G.729 is no longer special-cased: it is advertised on a WebRTC leg
+    /// exactly when the effective codec policy selects it (e.g. `g729` listed
+    /// in `[proxy] audio_codecs`, a route/trunk `allow_codecs`, or a
+    /// destination-trunk codec), in the configured / caller order. This keeps
+    /// negotiation consistent with the media plane, which already negotiates
+    /// and transcodes G.729 over rustrtc transports just like over plain RTP.
+    /// Codecs a client cannot handle (browsers do not implement G.729) are
+    /// simply not selected by that client's answer.
+    ///
+    /// Still enforced here:
+    /// - telephone-event entries are kept only when their clock rate matches a
+    ///   retained audio codec;
+    /// - if the list would otherwise contain no audio codec, fall back to the
+    ///   WebRTC default set so the generated SDP never has a DTMF-only audio
+    ///   m-line.
     pub fn filter_webrtc_offer_codecs(caller_sdp: &str, codecs: Vec<CodecInfo>) -> Vec<CodecInfo> {
-        let mut filtered: Vec<_> = codecs
-            .into_iter()
-            .filter(|codec| codec.codec != CodecType::G729)
-            .collect();
+        let mut filtered = codecs;
 
         let audio_clock_rates: HashSet<_> = Self::audio_clock_rates_in_order(&filtered)
             .into_iter()
@@ -784,6 +913,46 @@ impl MediaNegotiator {
 
         filtered.retain(|codec| !codec.is_dtmf() || audio_clock_rates.contains(&codec.clock_rate));
         filtered
+    }
+
+    /// Select the final audio codec list for an SDP answer: a strict subset of
+    /// the offer, keeping the caller-offered payload types. Preference order:
+    /// a previously negotiated codec (if still offered) wins, else the peer
+    /// answer's order (when available), else the configured allow-list.
+    /// Returns `None` when no compatible audio codec exists.
+    pub fn select_answer_codecs(
+        offer_sdp: &str,
+        preferred_peer_sdp: Option<&str>,
+        previous_negotiated_codec: Option<CodecType>,
+        allow_codecs: &[CodecType],
+    ) -> Option<Vec<CodecInfo>> {
+        let preferred_audio_codecs: Vec<CodecType> = preferred_peer_sdp
+            .map(|sdp| {
+                Self::extract_codec_params(sdp)
+                    .audio
+                    .into_iter()
+                    .map(|codec| codec.codec)
+                    .collect()
+            })
+            .filter(|codecs: &Vec<CodecType>| !codecs.is_empty())
+            .unwrap_or_else(|| allow_codecs.to_vec());
+        let offered_audio_codecs = Self::extract_codec_params(offer_sdp);
+        let previous_offered = previous_negotiated_codec.filter(|previous_codec| {
+            offered_audio_codecs
+                .audio
+                .iter()
+                .any(|codec| codec.codec == *previous_codec)
+        });
+        let selected_audio_codecs = if let Some(previous_codec) = previous_offered {
+            Self::build_codec_list_from_offer(offer_sdp, &[previous_codec])
+        } else {
+            Self::build_codec_list_from_offer(offer_sdp, &preferred_audio_codecs)
+        };
+        if selected_audio_codecs.is_empty() {
+            None
+        } else {
+            Some(selected_audio_codecs)
+        }
     }
 
     pub fn rewrite_sdp_codec_list(sdp: &str, new_codecs: &[CodecInfo]) -> Option<String> {
@@ -897,6 +1066,135 @@ impl MediaNegotiator {
         }
         result
     }
+
+    /// RFC 3264/4317 hold-signal test for a re-INVITE offer's audio
+    /// direction: any non-`sendrecv` direction signals hold; `sendrecv`
+    /// with a zero C-line (port 0 / `0.0.0.0`, non-ICE sections) also
+    /// signals hold per the RFC 4317 convention some endpoints use.
+    pub fn signals_hold(
+        direction: rustrtc::Direction,
+        offer: Option<&SessionDescription>,
+    ) -> bool {
+        if !matches!(direction, rustrtc::Direction::SendRecv) {
+            return true;
+        }
+        if let Some(offer) = offer {
+            for section in offer
+                .media_sections
+                .iter()
+                .filter(|section| section.kind == MediaKind::Audio)
+            {
+                if section.port == 0 {
+                    return true;
+                }
+                if Self::section_has_zero_hold_connection(
+                    section,
+                    offer.session.connection.as_deref(),
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns `true` when the connection C-line value represents a "zero" address,
+    /// commonly used to signal media hold per RFC 4317.
+    pub fn is_zero_connection(c: &str) -> bool {
+        let trimmed = c.trim();
+        trimmed == "IN IP4 0.0.0.0" || trimmed == "IN IP6 ::" || trimmed == "IN IP6 0:0:0:0:0:0:0:0"
+    }
+
+    /// True when an SDP media section signals hold via a zero C-line
+    /// (RFC 4317 convention). Sections using ICE (WebRTC) are excluded:
+    /// they reuse the zero C-line with active media flowing.
+    pub fn section_has_zero_hold_connection(
+        section: &rustrtc::MediaSection,
+        session_connection: Option<&str>,
+    ) -> bool {
+        let uses_ice = section.protocol.contains("UDP/TLS")
+            || section
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute.key.as_str(), "ice-ufrag" | "candidate"));
+        !uses_ice
+            && section
+                .connection
+                .as_deref()
+                .or(session_connection)
+                .is_some_and(Self::is_zero_connection)
+    }
+
+    /// Align the answer SDP direction per media section to the mirror of the
+    /// offer direction per RFC 3264 §5.1:
+    ///
+    /// | Offer        | Answer       |
+    /// |--------------|--------------|
+    /// | `sendonly`   | `recvonly`   |
+    /// | `recvonly`   | `sendonly`   |
+    /// | `inactive`   | `inactive`   |
+    /// | `sendrecv`   | `sendrecv`   |
+    ///
+    /// Also treats `port=0` and `c=IN IP4 0.0.0.0` (or `c=IN IP6 ::`)
+    /// as equivalent to `inactive`.
+    ///
+    /// Sections are matched by index between offer and answer (the answer
+    /// is expected to have the same number of `m=` lines).
+    pub fn align_answer_direction_with_offer(offer_sdp: &str, answer_sdp: &str) -> String {
+        let Ok(offer) = SessionDescription::parse(SdpType::Offer, offer_sdp) else {
+            tracing::warn!("Failed to parse offer SDP for direction alignment, returning answer unchanged");
+            return answer_sdp.to_string();
+        };
+
+        // Per offer-section: target answer direction string, or None to keep as-is.
+        let target_dirs: Vec<Option<&'static str>> = offer
+            .media_sections
+            .iter()
+            .map(|s| {
+                if s.port == 0 {
+                    return Some("inactive");
+                }
+                if Self::section_has_zero_hold_connection(s, offer.session.connection.as_deref()) {
+                    return Some("inactive");
+                }
+                match s.direction {
+                    rustrtc::Direction::SendOnly => Some("recvonly"),
+                    rustrtc::Direction::RecvOnly => Some("sendonly"),
+                    rustrtc::Direction::Inactive => Some("inactive"),
+                    rustrtc::Direction::SendRecv => None,
+                }
+            })
+            .collect();
+
+        let mut out = String::with_capacity(answer_sdp.len() + 64);
+        let mut section_idx = 0usize;
+        let mut seen_m = false;
+
+        for line in answer_sdp.lines() {
+            let l = line.strip_suffix('\r').unwrap_or(line);
+            if l.starts_with("m=") {
+                section_idx = if seen_m { section_idx + 1 } else { 0 };
+                seen_m = true;
+                out.push_str(l);
+                out.push_str("\r\n");
+                continue;
+            }
+            if seen_m {
+                if let Some(dir) = target_dirs.get(section_idx).copied().flatten() {
+                    if matches!(l, "a=sendrecv" | "a=sendonly" | "a=recvonly" | "a=inactive") {
+                        out.push_str("a=");
+                        out.push_str(dir);
+                        out.push_str("\r\n");
+                        continue;
+                    }
+                }
+            }
+            out.push_str(l);
+            out.push_str("\r\n");
+        }
+
+        out
+    }
 }
 
 #[cfg(test)]
@@ -931,6 +1229,18 @@ pub(crate) mod tests {
                 .collect(),
             rtx_payload_type: None,
         }
+    }
+
+    fn video_cap_with_rtx(
+        payload_type: u8,
+        rtx_payload_type: u8,
+        codec_name: &str,
+        fmtp: Option<&str>,
+        rtcp_fbs: &[&str],
+    ) -> rustrtc::config::VideoCapability {
+        let mut cap = video_cap(payload_type, codec_name, fmtp, rtcp_fbs);
+        cap.rtx_payload_type = Some(rtx_payload_type);
+        cap
     }
 
     #[test]
@@ -1065,6 +1375,172 @@ a=rtpmap:96 VP8/90000\r\n";
             .expect("BUNDLE video payload remap");
         assert_eq!(bundle_caps[0].payload_type, 97);
         assert_eq!(bundle_caps[1].payload_type, 98);
+    }
+
+    /// rustrtc renders freshly added video transceivers as `m=video 0`
+    /// without `a=rtcp-mux` even under `RtcpMuxPolicy::Require`, while BUNDLE
+    /// groups the m-line together with a muxed audio section. Browsers reject
+    /// such an offer's answer (`rtcp-mux must be enabled when BUNDLE is
+    /// enabled`) → JsSIP answers 500 and WebRTC video calls never connect.
+    /// The rewrite must restore the mux posture the session already has.
+    #[test]
+    fn bundled_video_mline_is_made_answerable() {
+        // The shape rustrtc's create_offer produces for a callee leg: audio
+        // active with mux attributes, video port 0 without them, BUNDLE over
+        // both mids.
+        let generated_offer = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=rtcp-mux\r\n\
+a=rtcp-mux-only\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 0 UDP/TLS/RTP/SAVPF 102\r\n\
+a=mid:1\r\n\
+a=rtcp-fb:102 nack\r\n";
+        let caps = vec![video_cap(102, "H264", None, &["nack"])];
+
+        let offer = MediaNegotiator::rewrite_video_capabilities(
+            SdpType::Offer,
+            generated_offer,
+            &caps,
+        )
+        .expect("video offer rewrite");
+
+        assert!(
+            offer.contains("m=video 9 "),
+            "port 0 video m-line must be restored for ICE media, got: {offer}"
+        );
+        let video_section = offer
+            .split("m=video ")
+            .nth(1)
+            .expect("video section present");
+        assert!(
+            video_section.contains("a=rtcp-mux\r\n"),
+            "BUNDLE-grouped video m-line must carry a=rtcp-mux, got: {offer}"
+        );
+    }
+
+    /// Plain-RTP sessions without any mux posture keep their video m-line
+    /// untouched (many SIP peers do not multiplex).
+    #[test]
+    fn non_mux_video_offer_is_left_untouched() {
+        let generated_offer = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 96\r\n\
+a=rtpmap:96 opus/48000/2\r\n\
+m=video 0 RTP/AVP 96\r\n\
+a=rtpmap:96 VP8/90000\r\n";
+        let caps = vec![video_cap(96, "VP8", None, &[])];
+
+        let offer = MediaNegotiator::rewrite_video_capabilities(
+            SdpType::Offer,
+            generated_offer,
+            &caps,
+        )
+        .expect("video offer rewrite");
+
+        assert!(
+            offer.contains("m=video 0 RTP/AVP"),
+            "no-mux session must keep the rejected port semantics, got: {offer}"
+        );
+        assert!(
+            !offer.contains("a=rtcp-mux"),
+            "must not inject rtcp-mux into a plain-RTP session, got: {offer}"
+        );
+    }
+
+    /// Caps carrying an rtx association must surface as `a=rtpmap rtx/90000`
+    /// + `a=fmtp apt=` on the rewritten m-line, with the rtx PT riding the
+    /// m-line formats — browsers key NACK retransmission off this trio.
+    #[test]
+    fn rewrite_emits_rtx_association() {
+        let generated_offer = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
+a=mid:1\r\n\
+a=rtcp-mux\r\n";
+        let caps = vec![video_cap_with_rtx(102, 103, "H264", None, &["nack"])];
+
+        let offer = MediaNegotiator::rewrite_video_capabilities(
+            SdpType::Offer,
+            generated_offer,
+            &caps,
+        )
+        .expect("video offer rewrite");
+
+        assert!(
+            offer.contains("m=video 9 UDP/TLS/RTP/SAVPF 102 103\r\n"),
+            "rtx PT must ride the m-line formats, got: {offer}"
+        );
+        assert!(offer.contains("a=rtpmap:103 rtx/90000\r\n"), "{offer}");
+        assert!(offer.contains("a=fmtp:103 apt=102\r\n"), "{offer}");
+    }
+
+    /// When a remapped primary's old rtx PT would collide with an occupied
+    /// slot (audio PT), the rtx association moves to a fresh PT instead of
+    /// colliding silently.
+    #[test]
+    fn remap_moves_rtx_when_primary_moves_into_occupied_rtx() {
+        // Primary 96 stays free, but its rtx PT 99 collides with audio PT 99
+        // → rtx must be re-seated; the primary itself never moves.
+        let mut caps = vec![video_cap_with_rtx(96, 99, "H264", None, &[])];
+        MediaNegotiator::remap_bundle_video_payload_types(&mut caps, [99u8])
+            .expect("remap");
+        assert_eq!(caps[0].payload_type, 96, "primary not colliding stays");
+        assert_ne!(
+            caps[0].rtx_payload_type,
+            Some(99),
+            "rtx must move off the occupied audio PT"
+        );
+        assert_ne!(
+            caps[0].rtx_payload_type,
+            Some(96),
+            "rtx must not collide with its own primary"
+        );
+    }
+
+    /// A remapped primary carries its rtx association along: the new primary
+    /// PT must never be re-seated onto another codec's rtx slot, and the
+    /// moved rtx must not collide either.
+    #[test]
+    fn remap_reserves_rtx_slots_against_primary_remap() {
+        // 96 must move (occupied by audio); 97's rtx PT is 96 — after 96
+        // moves away, 97 keeps its rtx; nothing may collide.
+        let mut caps = vec![
+            video_cap_with_rtx(96, 98, "H264", None, &[]),
+            video_cap_with_rtx(97, 96, "VP8", None, &[]),
+        ];
+        MediaNegotiator::remap_bundle_video_payload_types(&mut caps, [96u8])
+            .expect("remap");
+        let pts: Vec<u8> = caps
+            .iter()
+            .flat_map(|cap| [Some(cap.payload_type), cap.rtx_payload_type])
+            .flatten()
+            .collect();
+        let unique: std::collections::HashSet<u8> = pts.iter().copied().collect();
+        assert_eq!(
+            pts.len(),
+            unique.len(),
+            "primary + rtx PTs must be collision-free, got: {pts:?}"
+        );
+        assert!(!pts.contains(&96), "occupied audio PT 96 must not be reused");
+        // First cap's primary moved off 96; its rtx association stays intact.
+        assert_ne!(caps[0].payload_type, 96);
+        assert!(caps[0].rtx_payload_type.is_some());
+        assert!(caps[1].rtx_payload_type.is_some());
     }
 
     /// When every dynamic video payload type (96..=127) is already occupied
@@ -2600,7 +3076,7 @@ a=rtpmap:0 PCMU/8000\r\n";
     }
 
     #[test]
-    fn test_webrtc_offer_filter_removes_g729() {
+    fn test_webrtc_offer_filter_keeps_g729_when_allowed() {
         let caller_sdp = "v=0\r\n\
             o=- 1 1 IN IP4 127.0.0.1\r\n\
             s=-\r\n\
@@ -2616,13 +3092,23 @@ a=rtpmap:0 PCMU/8000\r\n";
         );
         let codecs = MediaNegotiator::filter_webrtc_offer_codecs(caller_sdp, codecs);
         let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
-        assert_eq!(audio.len(), 1);
-        assert_eq!(audio[0].codec, CodecType::PCMU);
-        assert!(!codecs.iter().any(|c| c.codec == CodecType::G729));
+        assert_eq!(
+            audio[0].codec,
+            CodecType::G729,
+            "G729 must lead when the policy allows it and the caller offered it first"
+        );
+        assert!(
+            codecs.iter().any(|c| c.codec == CodecType::G729),
+            "G729 must survive the WebRTC offer filter when the policy allows it"
+        );
+        assert!(
+            codecs.iter().any(|c| c.is_dtmf() && c.clock_rate == 8000),
+            "telephone-event/8000 must be retained alongside G729"
+        );
     }
 
     #[test]
-    fn test_webrtc_offer_filter_falls_back_when_policy_is_g729_only() {
+    fn test_webrtc_offer_filter_keeps_g729_only_policy() {
         let caller_sdp = "v=0\r\n\
             o=- 1 1 IN IP4 127.0.0.1\r\n\
             s=-\r\n\
@@ -2637,8 +3123,9 @@ a=rtpmap:0 PCMU/8000\r\n";
         );
         let codecs = MediaNegotiator::filter_webrtc_offer_codecs(caller_sdp, codecs);
         let audio: Vec<_> = codecs.iter().filter(|c| !c.is_dtmf()).collect();
-        assert!(!audio.is_empty(), "WebRTC offer must keep an audio codec");
-        assert!(!codecs.iter().any(|c| c.codec == CodecType::G729));
+        assert_eq!(audio.len(), 1, "a G729-only policy yields exactly one audio codec");
+        assert_eq!(audio[0].codec, CodecType::G729);
+        assert_eq!(audio[0].payload_type, 18, "the caller's G729 PT must be preserved");
     }
 
     #[test]

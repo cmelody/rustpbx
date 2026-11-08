@@ -98,7 +98,7 @@ async fn two_rtp_legs_negotiate_via_sdp() {
     assert!(offer.contains("RTP/AVP"), "RTP leg offer must be RTP/AVP");
     let answer = b.answer(&offer).await.expect("answer");
     // a applies the answer.
-    a.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    a.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply answer");
 
@@ -125,7 +125,7 @@ async fn bridge_records_symmetric_routes() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.unwrap();
     let answer = lb.answer(&offer).await.unwrap();
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .unwrap();
 
@@ -276,7 +276,7 @@ async fn dtmf_bus_fans_out_digit() {
 /// detect_transport correctly classifies SDP bodies.
 #[test]
 fn detect_transport_classification() {
-    use rustrtc::TransportMode;
+    use rustpbx_media::TransportMode;
     assert_eq!(
         negotiate::detect_transport("m=audio 1234 RTP/AVP 0\r\n"),
         TransportMode::Rtp
@@ -301,7 +301,7 @@ async fn play_file_fires_on_end() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply answer");
 
@@ -324,13 +324,14 @@ async fn play_file_fires_on_end() {
     mb.close();
 }
 
-/// `bridge_play_pcm` — the raw-PCM streaming inject used by `voip_bridge` and
-/// the realtime app — must pace written frames out the leg egress and resolve
-/// the `on_end` callback when the writer drops the channel (natural end).
-/// Guard test: any regression in `ChannelAudioSource` pacing/EOF semantics
-/// breaks both consumers, so it is pinned here at the integration level.
+/// `ChannelAudioSource` — the raw-PCM streaming inject used by `voip_bridge`
+/// and the realtime app (via `Leg::play`) — must pace written frames out the
+/// leg egress and resolve the `on_end` callback when the writer drops the
+/// channel (natural end). Guard test: any regression in `ChannelAudioSource`
+/// pacing/EOF semantics breaks both consumers, so it is pinned here at the
+/// integration level.
 #[tokio::test]
-async fn bridge_play_pcm_streams_and_fires_on_end() {
+async fn channel_audio_source_writer_drop_fires_natural_end() {
     let mut mb = MediaBridge::new("it-pcm-stream");
     let a = LegInner::new("a", &LegConfig::rtp_pcmu(), None).unwrap();
     let b = LegInner::new("b", &LegConfig::rtp_pcmu(), None).unwrap();
@@ -340,7 +341,7 @@ async fn bridge_play_pcm_streams_and_fires_on_end() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply answer");
 
@@ -356,10 +357,17 @@ async fn bridge_play_pcm_streams_and_fires_on_end() {
         });
 
     // 20ms @ 8kHz = 160 samples per frame; stream 10 frames (200ms) then drop.
-    let tx = mb
-        .bridge_play_pcm(LegSide::A, 8000, Some(on_end))
-        .await
-        .expect("bridge_play_pcm");
+    // Same wiring the session uses (Leg::play over a ChannelAudioSource).
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    la.play(
+        Box::new(rustpbx_media::audio_source::ChannelAudioSource::new(
+            rx, 8000,
+        )),
+        false,
+        Some(on_end),
+    )
+    .await
+    .expect("channel source playback must start");
     let frame = vec![1000i16; 160];
     for _ in 0..10 {
         tx.send(frame.clone())
@@ -370,7 +378,7 @@ async fn bridge_play_pcm_streams_and_fires_on_end() {
 
     let interrupted = tokio::time::timeout(std::time::Duration::from_secs(3), end_rx)
         .await
-        .expect("bridge_play_pcm must fire on_end after writer drop")
+        .expect("playback must fire on_end after writer drop")
         .expect("on_end channel must resolve");
     assert!(
         !interrupted,
@@ -393,7 +401,7 @@ async fn mediabridge_hold_resume_preserves_route() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.unwrap();
     let answer = lb.answer(&offer).await.unwrap();
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .unwrap();
 
@@ -479,7 +487,7 @@ async fn file_recorder_writes_wav() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply answer");
     recording.start_recording(la.negotiated().unwrap(), rustpbx_media::recorder::RecorderOption::new(path.clone()), 2, false, None)
@@ -667,7 +675,7 @@ async fn rtp_timeout_does_not_fire_on_active_rtp() {
     let remote = LegInner::new("remote", &LegConfig::rtp_pcmu(), None).unwrap();
     let offer = a.create_offer().await.unwrap();
     let answer = remote.answer(&offer).await.unwrap();
-    a.apply_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+    a.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
     remote.pc().wait_for_rtp_transport_ready(std::time::Duration::from_secs(2)).await.unwrap();
     mb.replace_leg(LegSide::A, a).await;
 
@@ -804,9 +812,11 @@ async fn rtp_timeout_fires_on_inactive_b_leg() {
 /// out the same way as an RTP leg.
 #[tokio::test]
 async fn rtp_timeout_fires_on_inactive_webrtc_leg() {
-    use rustrtc::TransportMode;
+    use rustpbx_media::TransportMode;
 
     let cfg = LegConfig {
+        volume_stats: Default::default(),
+        quality_stats: Default::default(),
         call_id: None,
         ice_servers: Vec::new(),
         relay_only: false,
@@ -821,14 +831,18 @@ async fn rtp_timeout_fires_on_inactive_webrtc_leg() {
         }],
         video_codecs: Vec::new(),
         rtp_port_range: None,
-        external_ip: None,
-        bind_ip: None,
+        external_ips: Vec::new(),
+        bind_ips: Vec::new(),
+        prefer_ipv6: false,
         cname: Some("rtp-timeout-webrtc".to_string()),
         comfort_noise: true,
         comfort_noise_level_db: -35.0,
         enable_latching: true,
         probation_max_packets: None,
+        inband_dtmf: Default::default(),
         relay_ready_timeout: None,
+        ingress_stall_warn_secs: 0,
+        root_session_id: None,
     };
     let mut mb = MediaBridge::new("it-rtp-webrtc");
     let a = LegInner::new("a", &cfg, None).unwrap();
@@ -860,7 +874,7 @@ async fn relay_full_lifecycle_with_accept_gate() {
     // 1. SDP exchange so both legs have negotiated audio profiles.
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply a");
 
@@ -910,7 +924,7 @@ async fn play_file_during_bridge_then_resume() {
     // SDP + bridge + accept both.
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply a");
     mb.bridge().await.unwrap();
@@ -944,7 +958,7 @@ async fn multi_cycle_bridge_play_hold_resume_unbridge() {
 
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply a");
 
@@ -998,7 +1012,7 @@ async fn play_file_handle_completes_on_natural_eof() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply");
 
@@ -1039,7 +1053,7 @@ async fn stop_play_interrupts_handle() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply");
 
@@ -1080,7 +1094,7 @@ async fn loop_playback_does_not_resolve_until_stopped() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply");
 
@@ -1130,7 +1144,7 @@ async fn double_play_file_interrupts_first_handle_contract() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply");
     mb.accept(LegSide::A).await;
@@ -1184,7 +1198,7 @@ async fn play_file_both_handles_complete_and_resume_rebridges() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply");
     mb.accept(LegSide::A).await;
@@ -1267,7 +1281,7 @@ async fn stop_play_on_held_peers_allows_resume() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.expect("offer");
     let answer = lb.answer(&offer).await.expect("answer");
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .expect("apply");
     mb.accept(LegSide::A).await;
@@ -1313,7 +1327,7 @@ async fn replace_leg_releases_replaced_leg_and_rtcp_tasks() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.unwrap();
     let answer = lb.answer(&offer).await.unwrap();
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .unwrap();
     mb.accept(LegSide::A).await;
@@ -1370,7 +1384,7 @@ async fn unbridge_bridge_cycles_do_not_accumulate_rtcp_tasks() {
     let lb = mb.leg(LegSide::B).unwrap();
     let offer = la.create_offer().await.unwrap();
     let answer = lb.answer(&offer).await.unwrap();
-    la.apply_sdp(&answer, rustrtc::SdpType::Answer)
+    la.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
         .await
         .unwrap();
     mb.accept(LegSide::A).await;
@@ -1443,7 +1457,7 @@ async fn standalone_peer_playback_input_and_recording() {
     let remote = LegInner::new("phone", &cfg, None).unwrap();
     let offer = peer.create_offer().await.unwrap();
     let answer = remote.answer(&offer).await.unwrap();
-    peer.apply_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+    peer.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
     peer.accept();
     remote.accept();
     let (recorder, mut captured) = recorder_capture("single-peer");
@@ -1480,7 +1494,7 @@ async fn bridge_rtp_timeout_tracks_fast_path_ingress() {
         let phone = LegInner::new(format!("phone-{id}"), &LegConfig::rtp_pcmu(), None).unwrap();
         let offer = peer.create_offer().await.unwrap();
         let answer = phone.answer(&offer).await.unwrap();
-        peer.apply_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+        peer.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
         peer.accept();
         phone.accept();
         peers.push(peer);
@@ -1510,7 +1524,7 @@ async fn caller_dtmf_subscription_closes_when_peer_drops() {
     let remote = LegInner::new("remote", &LegConfig::rtp_pcmu(), None).unwrap();
     let offer = caller.create_offer().await.unwrap();
     let answer = remote.answer(&offer).await.unwrap();
-    caller.apply_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+    caller.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
     caller.pc().wait_for_rtp_transport_ready(std::time::Duration::from_secs(2)).await.unwrap();
     let mut rx = caller.subscribe_dtmf();
     drop(caller);
@@ -1550,7 +1564,7 @@ async fn relay_timeline_survives_hold_playback_and_source_switches() {
             if id == "b" { phone.pc().add_observer(capture.clone()); }
             let offer = peer.create_offer().await.unwrap();
             let answer = phone.answer(&offer).await.unwrap();
-            peer.apply_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+            peer.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
             peer.accept();
             phone.accept();
             peers.push(peer);

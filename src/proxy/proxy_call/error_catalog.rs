@@ -173,6 +173,20 @@ pub const DIAL_ALL_TARGETS_FAILED: CallErrInfo = CallErrInfo {
     remediation_key: None,
 };
 
+/// One target of a multi-target sequential plan failed. Traced per attempt so
+/// CDR hooks can account for every trunk that was tried; the call outcome is
+/// still reported by the final attempt.
+pub const DIAL_ATTEMPT_FAILED: CallErrInfo = CallErrInfo {
+    app: "dial",
+    code: "dial.attempt_failed",
+    message: "Dial attempt failed",
+    sip_status: None,
+    hangup_reason: CallRecordHangupReason::Failed,
+    severity: ErrSeverity::Warn,
+    locale_key: "errors.dial.attempt_failed",
+    remediation_key: None,
+};
+
 pub const DIAL_CALLER_CANCELLED: CallErrInfo = CallErrInfo {
     app: "dial",
     code: "dial.caller_cancelled",
@@ -352,6 +366,25 @@ pub const LEG_MEDIA_STALLED: CallErrInfo = CallErrInfo {
     remediation_key: Some("errors.proxy.media_stalled.remediation"),
 };
 
+/// Mid-call counterpart covering the OTHER half of inbound-media failures:
+/// a leg that HAS been receiving RTP and then went silent — including the
+/// pre-bridge IVR/queue phase the bridge health monitor cannot observe
+/// (its `proxy.media_stalled` requires lifetime RX == 0). Typical causes:
+/// the upstream gateway stopped sending (VAD/silence suppression — check
+/// `rtcp_age_secs`, which keeps advancing while the peer is alive), path
+/// loss, or an SBC media-session timeout. Fired once per affected leg via
+/// the leg's own stall watcher; never changes the hangup outcome.
+pub const LEG_INGRESS_STALLED: CallErrInfo = CallErrInfo {
+    app: "proxy",
+    code: "proxy.ingress_stalled",
+    message: "Inbound media stopped after flowing on a leg",
+    sip_status: None,
+    hangup_reason: CallRecordHangupReason::Other(String::new()),
+    severity: ErrSeverity::Warn,
+    locale_key: "errors.proxy.ingress_stalled",
+    remediation_key: Some("errors.proxy.ingress_stalled.remediation"),
+};
+
 pub const CATALOG: &[CallErrInfo] = &[
     QUEUE_ABANDONED,
     QUEUE_ALL_AGENTS_UNAVAILABLE,
@@ -368,6 +401,7 @@ pub const CATALOG: &[CallErrInfo] = &[
     QUEUE_ALL_AGENTS_UNAVAILABLE_DEFAULT,
     QUEUE_TRANSFER_FAILED,
     DIAL_ALL_TARGETS_FAILED,
+    DIAL_ATTEMPT_FAILED,
     DIAL_CALLER_CANCELLED,
     DIAL_FORK_FAILED,
     DIAL_FORK_JOIN_ERROR,
@@ -382,4 +416,5 @@ pub const CATALOG: &[CallErrInfo] = &[
     RTP_TIMEOUT,
     LEG_MEDIA_INCOMPLETE,
     LEG_MEDIA_STALLED,
+    LEG_INGRESS_STALLED,
 ];

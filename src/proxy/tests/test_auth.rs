@@ -59,6 +59,7 @@ async fn test_auth_module_invite_success() {
             status_code: rsipstack::sip::StatusCode::ProxyAuthenticationRequired,
             headers: tx.original.headers().clone(),
             body: vec![],
+            wire_reason: None,
         };
         let proxy_auth = module.create_proxy_auth_challenge("rustpbx.com").unwrap();
         response.headers.push(Header::ProxyAuthenticate(proxy_auth));
@@ -220,6 +221,7 @@ async fn test_auth_module_register_success() {
             status_code: rsipstack::sip::StatusCode::Unauthorized,
             headers: tx.original.headers().clone(),
             body: vec![],
+            wire_reason: None,
         };
         let www_auth = module.create_www_auth_challenge("rustpbx.com").unwrap();
         response.headers.push(Header::WwwAuthenticate(www_auth));
@@ -507,10 +509,14 @@ async fn test_guest_call_allowed_extension() {
         database: None,
         user_backend: Box::new(user_backend),
         auth_backend: Vec::new(),
+        registration_response_hook: None,
         call_router: None,
         locator,
         callrecord_sender: None,
         endpoint,
+        // Direct construction (no builder snapshot): empty listen list keeps
+        // `is_same_realm` on its user_backend fallback.
+        local_listen_addrs: Vec::new(),
         dialog_layer,
         dialplan_inspectors: Arc::new(parking_lot::RwLock::new(Vec::new())),
         create_route_invites: Vec::new(),
@@ -530,6 +536,7 @@ async fn test_guest_call_allowed_extension() {
         rwi_gateway: None,
         ivr_trace: None,
         tls_listener: None,
+        bound_transports: std::sync::Mutex::new(Vec::new()),
         conference_manager: conf_mgr,
         conference_server: conf_server,
         agent_registry: None,
@@ -541,7 +548,7 @@ async fn test_guest_call_allowed_extension() {
         cluster_peers: vec![],
         cluster_self_addr: None,
         session_registry: Arc::new(crate::call::runtime::NoopSessionRegistry),
-        session_registry_heartbeat: None,
+        session_registry_heartbeat: std::sync::Mutex::new(None),
         trunk_health: None,
         session_hooks: Arc::new(Vec::new()),
         contact_username: "rustpbx".to_string(),
@@ -684,7 +691,7 @@ fn create_sip_request(
     ));
 
     let call_id = rsipstack::sip::headers::CallId::new("test-call-id");
-    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method };
+    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method: method.clone() };
 
     let mut request = rsipstack::sip::Request {
         method,
@@ -977,6 +984,7 @@ async fn test_proxy_auth_invite_success() {
             status_code: rsipstack::sip::StatusCode::ProxyAuthenticationRequired,
             headers: tx.original.headers().clone(),
             body: vec![],
+            wire_reason: None,
         };
 
         // Add Proxy-Authenticate header
@@ -1110,6 +1118,7 @@ async fn test_proxy_auth_wrong_credentials() {
             status_code: rsipstack::sip::StatusCode::ProxyAuthenticationRequired,
             headers: tx.original.headers().clone(),
             body: vec![],
+            wire_reason: None,
         };
 
         // Add Proxy-Authenticate header
@@ -1193,6 +1202,7 @@ async fn test_dialog_auth_cache_skips_in_dialog_reinvite() {
             status_code: rsipstack::sip::StatusCode::ProxyAuthenticationRequired,
             headers: tx.original.headers().clone(),
             body: vec![],
+            wire_reason: None,
         };
         let proxy_auth = module.create_proxy_auth_challenge("rustpbx.com").unwrap();
         response.headers.push(Header::ProxyAuthenticate(proxy_auth));

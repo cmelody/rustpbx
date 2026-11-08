@@ -136,6 +136,38 @@ are excluded since they always negotiate full ICE.
 | Trunk opt-out for detected caller | off | `false` | yes | off (trunk wins) |
 | Global rollout | `true` | — | — | `a=ice-lite` everywhere (RTP legs) |
 
+### Custom SDP attribute pass-through (`passthrough_custom_sdp_attrs`)
+
+Trunking peers often attach vendor-specific SDP attributes (e.g.
+`a=x-switch-context`, `a=carrier-id`) to their offers and answers. By default
+rustpbx carries these **custom (non-standard) `a=` attributes across the B2BUA
+rewrite in both directions**: attributes from the caller's INVITE reach the
+trunk's INVITE, and attributes from the trunk's answer reach the caller's
+200 OK. Media-level attributes stay in their media section (sections are
+matched by `a=mid`, falling back to order); session-level attributes stay
+session-level. Standard attributes (`rtpmap`, `fmtp`, `ice-*`, `candidate`,
+direction, …) are never touched by this switch — they follow their own RFC
+semantics.
+
+Two reasons to turn it off per trunk (`passthrough_custom_sdp_attrs = false`):
+
+- The peer rejects calls on unexpected SDP lines (strict parsers).
+- Internal attribute names must not leak towards the peer (or vice versa).
+
+Stripping applies in **both** directions for that trunk: its own custom
+attributes never leave towards the peer, and the SDP it receives carries none
+from the other side. Source and destination trunks AND together — a call
+through a disabled source trunk **or** a disabled destination trunk is
+stripped end to end.
+
+```toml
+[proxy.trunks.strict-pstn]
+dest = "sip:pstn.example.com:5060"
+passthrough_custom_sdp_attrs = false   # default (unset) = pass through
+```
+
+Console: persisted as `metadata.sbc.passthrough_custom_sdp_attrs`.
+
 ### Choosing the right combination (Bug 1 + 2 scenarios)
 
 | Scenario | Server `media_proxy` | Trunk `media_mode` | Trunk `external_ip` | Result |
@@ -249,7 +281,17 @@ callee_deny = ["911"]
 # Recording quality
 samplerate = 16000      # Resampled 16-bit PCM WAV output rate (Hz); optional
 ptime = 20              # File-recorder flush interval (ms); default 500
-stereo_swap = false     # true: callee left, caller right (stereo only)
+# Stereo channel assignment (stereo recordings only):
+#   caller_left   (default) caller → left, callee → right
+#   callee_left             callee → left, caller → right
+#   external_left           external party → left, internal → right; falls back
+#                           to caller-left when both sides are the same realm
+#   external_right          external party → right, internal → left; the mirror
+#                           of external_left (falls back to caller-right)
+# stereo_mode = "external_left"
+# Deprecated direct swap (true ≡ callee_left); honoured only when no layer
+# configures stereo_mode:
+# stereo_swap = false
 
 # Hybrid mode: force legacy WAV recorder even when [sipflow] is active
 # When true, SipFlow captures signalling only; [recording] handles media
@@ -270,7 +312,7 @@ directions = ["inbound"]
 auto_start = true
 ```
 
-File recording settings also apply to on-demand recording. Per-call overrides take precedence over the server recording policy. An explicit `samplerate` (8000–192000 Hz) selects resampled 16-bit PCM WAV; omitting it preserves the codec-based WAV output. `ptime` must be positive and controls file flushing, not RTP packetization. These settings do not change SipFlow packet capture.
+File recording settings also apply to on-demand recording. Per-call overrides take precedence over the server recording policy. An explicit `samplerate` (8000–192000 Hz) selects resampled 16-bit PCM WAV; omitting it preserves the codec-based WAV output. `ptime` must be positive and controls file flushing, not RTP packetization. `stereo_mode = "external_left"` places the external party on the left channel of stereo recordings and `stereo_mode = "external_right"` on the right (the mirror) — both resolved per call from the inbound trunk context, the call direction (realm-derived), and the originate topology — falling back to caller-left / caller-right respectively when both sides are internal or both external. These settings do not change SipFlow packet capture (sipflow recordings honour `stereo_mode` by swapping capture legs, so exports inherit it).
 
 ### HTTP Recording Upload
 ```toml
@@ -406,6 +448,49 @@ Notes:
   per-source bucket.
 - Hot-reload friendly: saving from the console (or reloading the config)
   rebuilds the Storage of every bucket.
+
+### Video Call Recording (`[recording.video]`)
+
+When enabled, a call whose negotiated SDP carries an **H264** video m-line
+(`video_policy = "pass_through"` keeps video on the legs) additionally
+records **each leg's video as its own MP4 file** next to the audio artifact:
+
+- `{base}_caller.mp4` / `{base}_callee.mp4` — one file per leg, containing
+  exactly the media that leg sent (mirrors the stereo WAV convention).
+- Recording starts at the **first keyframe (IDR)**: a mid-call start waits
+  for the next natural IDR (typically well under one GOP, ~1–2 s) and drops
+  pre-IDR frames, so files are decodable from their first sample.
+- The MP4 files ride the same lifecycle as the audio WAV: CDR `recorder[]`
+  segments (with `media_kind = "video"`), `recording_metadata_available`
+  events, the console call-record detail page (per-leg video players), and
+  the upload hooks — S3/OSS/HTTP uploads set `content-type: video/mp4` by
+  extension, and per-source targets (`[recording.sources.*]`) apply to the
+  companion files unchanged.
+- The console playback endpoint streams MP4 with HTTP Range support
+  (`GET /call-records/{id}/recording?segment={unique_id}`).
+
+Scope notes:
+
+- **Audio stays in the WAV artifact** — the MP4 files are video-only. This
+  is a deliberate ecosystem constraint: no pure-Rust MP4 muxer supports
+  Opus and no pure-Rust AAC encoder exists, and RustPBX avoids new C
+  dependencies by default.
+- **VP8-only calls** degrade to the audio-only WAV (logged once per call).
+  VP9/WebM are future work.
+- Packet loss degrades individual frames (decoders skip to the next IDR)
+  rather than corrupting the file; the video capture queue drops under
+  saturation while audio recording is never starved.
+
+```toml
+[recording]
+enabled = true
+type = "s3"
+bucket = "recordings"
+
+[recording.video]
+enabled = true
+codec = "h264"   # only h264 today; VP8 calls fall back to audio-only
+```
 
 ### Outbound Ringback Recording (record_ringing)
 

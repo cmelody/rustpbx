@@ -98,9 +98,24 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
             api_auth_middleware,
         ));
 
+    // Public (unauthenticated) addon endpoints — merged onto the same api
+    // prefix tree but OUTSIDE the auth/CSRF layers above (Addon::
+    // console_public_api_routes). Addons own their abuse protection on these
+    // routes (body limits, rate limiting).
+    let mut api_router = Router::new().merge(api_routes);
+    if let Some(app_state) = state.app_state() {
+        let config = app_state.config();
+        for r in app_state
+            .addon_registry
+            .get_console_public_api_routes(&state, &config)
+        {
+            api_router = api_router.merge(r);
+        }
+    }
+
     let api_prefix = state.api_prefix().to_string();
     Router::new()
-        .nest(&api_prefix, api_routes)
+        .nest(&api_prefix, api_router)
         .with_state(state)
 }
 

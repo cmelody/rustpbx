@@ -35,16 +35,17 @@ pub struct E2eTestServerInject {
     /// through it — drive it with a webhook handler to capture full event
     /// sequences.
     pub rwi_gateway: Option<rustpbx::rwi::RwiGatewayRef>,
-    /// CC database whose policies/bindings the outbound-policy chain node
-    /// (same wiring as the cc addon's `proxy_server_hook`) enforces.
-    #[cfg(feature = "addon-cc")]
-    pub cc_policy_db: Option<sea_orm::DatabaseConnection>,
     /// Queue location enricher (screen-pop `Call-Info` / `User-to-User`
     /// injection on queue-dispatched agent legs). The cc addon attaches its
     /// `CcQueueLocationEnricher` in production; tests supply one (backed by
     /// a seeded `CcAddonState`) to exercise the same injection path.
     pub queue_enricher: Option<Arc<dyn rustpbx::proxy::call::QueueLocationEnricher>>,
     pub bans: Option<Arc<rustpbx::security::BanStore>>,
+    /// Register the `acl` module (opt-in: the ACL default-deny posture would
+    /// break tests that never modeled trunk IPs, so it stays off unless a
+    /// test needs inbound source-trunk resolution — `is_from_trunk_context`
+    /// lives there and attaches the `TrunkContext` the matcher merges).
+    pub register_acl: bool,
 }
 
 
@@ -55,10 +56,9 @@ impl Default for E2eTestServerInject {
             session_hook: None,
             agent_registry: None,
             rwi_gateway: None,
-            #[cfg(feature = "addon-cc")]
-            cc_policy_db: None,
             queue_enricher: None,
             bans: None,
+            register_acl: false,
         }
     }
 }
@@ -236,6 +236,17 @@ impl E2eTestServer {
             config.ws_port = base.ws_port;
             config.useragent = base.useragent;
             config.modules = base.modules;
+            if inject.register_acl {
+                // ACL must precede `call`: CallModule::on_transaction_begin
+                // fully processes the INVITE (and returns Abort), so a
+                // trailing acl module never runs and never attaches the
+                // TrunkContext the matcher merges as source-trunk hints.
+                // This mirrors the production module order
+                // (`["acl", "auth", ..., "call"]`).
+                let mut modules = vec!["acl".to_string()];
+                modules.extend(config.modules.clone().unwrap_or_default());
+                config.modules = Some(modules);
+            }
             config.ensure_user = Some(false);
             // Latching: keep the caller's value (ProxyConfig::default() is
             // enabled; constructors that need it off set it explicitly
@@ -244,6 +255,11 @@ impl E2eTestServer {
             let mode = config.media_proxy;
             let (builder, cdr_capture, cancel_token) = Self::base_builder(config, &inject).await?;
             let builder = test_helpers::register_standard_modules(builder);
+            let builder = if inject.register_acl {
+                builder.register_module("acl", rustpbx::proxy::acl::AclModule::create)
+            } else {
+                builder
+            };
             #[allow(unused_mut)]
             let mut builder = match &inject.agent_registry {
                 Some(registry) => builder.with_agent_registry(registry.clone()),
@@ -254,24 +270,6 @@ impl E2eTestServer {
             // same wiring as `with_queue_location_enricher` in production.
             if let Some(enricher) = &inject.queue_enricher {
                 builder = builder.with_queue_location_enricher(enricher.clone());
-            }
-
-            // CC outbound-policy chain node, same wiring as the cc addon.
-            #[cfg(feature = "addon-cc")]
-            if let Some(db) = &inject.cc_policy_db {
-                use rustpbx::addons::cc::outbound_policy::{
-                    CcAgentPolicyRouteInvite, OutboundPolicyResolver,
-                };
-                let resolver = std::sync::Arc::new(OutboundPolicyResolver::new(db.clone()));
-                builder = builder.with_create_route_invite(std::sync::Arc::new(
-                    move |server, _proxy_config, routing_state| {
-                        Ok(Box::new(CcAgentPolicyRouteInvite::new(
-                            resolver.clone(),
-                            routing_state,
-                            server.data_context.clone(),
-                        )) as Box<dyn rustpbx::call::RouteInvite>)
-                    },
-                ));
             }
 
             match Self::start_builder(

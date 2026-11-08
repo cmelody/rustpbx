@@ -50,6 +50,12 @@ pub struct ActiveCallContextMeta {
     /// how long the call has been sitting in the IVR.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ivr_entered_at: Option<DateTime<Utc>>,
+    /// Wall-clock time the call entered the queue — stamped when the queue
+    /// app starts (`start_queue_app`). The monitor uses it as the wait-time
+    /// source for the meta-fallback queued rows (shared `cc_acd_queue` row
+    /// missing) so their wait clock starts at queue entry, not dialog start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_entered_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,6 +282,18 @@ impl ActiveProxyCallRegistry {
         self.context_meta.get(session_id).map(|e| e.clone())
     }
 
+    /// True when at least one live call carries queue context (`queue_id`
+    /// stamped by the queue app). Used by the rolling handover's idle-conn
+    /// eviction as a busy gate: while callers are waiting in a queue, the
+    /// draining predecessor must keep its agent connections reachable —
+    /// evicting them would strand the waiters on a generation whose agents
+    /// have re-homed onto the successor.
+    pub fn has_queued_calls(&self) -> bool {
+        self.context_meta
+            .iter()
+            .any(|e| e.value().queue_id.is_some())
+    }
+
     pub fn count(&self) -> usize {
         self.entries.len()
     }
@@ -300,6 +318,19 @@ impl ActiveProxyCallRegistry {
     /// Get all active session IDs
     pub fn session_ids(&self) -> Vec<String> {
         self.entries.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Session and dialog identities whose owner records must remain live.
+    pub fn live_call_ids(&self) -> Vec<String> {
+        let mut ids = self.session_ids();
+        ids.extend(
+            self.handles_by_dialog
+                .iter()
+                .map(|entry| entry.key().clone()),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Alias for count() for SessionRegistry compatibility
@@ -656,5 +687,40 @@ mod tests {
         assert_eq!(meta.queue_name.as_deref(), Some("Support"));
         registry.remove(session);
         assert!(registry.get_context_meta(session).is_none());
+    }
+
+    /// Rolling-handover eviction gate: a queued call must flip
+    /// `has_queued_calls` until its context is removed.
+    #[test]
+    fn test_has_queued_calls_gate() {
+        let registry = ActiveProxyCallRegistry::new();
+        assert!(!registry.has_queued_calls());
+
+        let session = "rolling-queue-gate";
+        registry.upsert(make_entry(session), make_handle(session));
+        registry.set_context_meta(
+            session.to_string(),
+            ActiveCallContextMeta {
+                queue_id: Some("q1".to_string()),
+                queue_name: Some("Support".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            registry.has_queued_calls(),
+            "a queued caller must gate the eviction loop"
+        );
+
+        // Non-queue call does NOT gate.
+        let other = "plain-call";
+        registry.upsert(make_entry(other), make_handle(other));
+        assert!(registry.has_queued_calls());
+
+        registry.remove(session);
+        assert!(
+            !registry.has_queued_calls(),
+            "queue drained → eviction may resume"
+        );
+        registry.remove(other);
     }
 }

@@ -1,11 +1,11 @@
 use crate::app::AppStateInner;
 use crate::callrecord::{derive_daily_url, today_string};
-use crate::config::{CallRecordConfig, ConsoleConfig};
+use crate::config::{CallRecordConfig, ConsoleAclConfig, ConsoleConfig};
 use crate::console::i18n::{I18n, LocaleConfig, detect_locale};
 use crate::console::middleware::RenderTemplate;
 use crate::models::rbac::{role_permission, user_role};
 use crate::proxy::server::SipServerRef;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
@@ -79,6 +79,11 @@ pub enum ReloadTarget {
 pub struct ConsoleState {
     db: DatabaseConnection,
     config: ConsoleConfig,
+    /// Hot-reloadable `[console.acl]` snapshot (`reload_acl_config`). The
+    /// rest of `[console]` is fixed for the process lifetime; only the ACL
+    /// follows the repo's reload contract, mirroring the proxy
+    /// `DataContext::acl_rules` pattern (swap under lock, readers snapshot).
+    acl_config: Arc<RwLock<ConsoleAclConfig>>,
     session_key: Vec<u8>,
     http_client: reqwest::Client,
     sip_server: Arc<RwLock<Option<SipServerRef>>>,
@@ -108,6 +113,12 @@ pub trait AddonState: std::any::Any + Send + Sync + Clone + 'static {}
 
 impl<T: std::any::Any + Send + Sync + Clone + 'static> AddonState for T {}
 
+/// `?next=<target>`, encoded so a target with its own query (`?a=1&b=2`)
+/// stays one parameter.
+fn next_query(next: &str) -> String {
+    format!("?next={}", urlencoding::encode(next))
+}
+
 impl ConsoleState {
     pub async fn initialize(
         db: DatabaseConnection,
@@ -122,9 +133,11 @@ impl ConsoleState {
 
         let locale_config = LocaleConfig::from(&config);
         let i18n = Arc::new(I18n::new(locale_config));
+        let acl_config = Arc::new(RwLock::new(config.acl.clone()));
 
         Ok(Arc::new(Self {
             db,
+            acl_config,
             config,
             session_key,
             http_client: crate::http_util::build_keepalive_client(None, None)?,
@@ -336,27 +349,45 @@ impl ConsoleState {
             let static_path = self.config().static_path();
             map.entry("static_path")
                 .or_insert_with(|| serde_json::Value::String(static_path.clone()));
-            map.entry("site_logo").or_insert_with(|| {
-                serde_json::Value::String(if brand.logo_url.is_empty() {
-                    format!("{}/images/logo.png", static_path)
-                } else if let Some(rest) = brand.logo_url.strip_prefix("/static") {
-                    format!("{}{}", static_path, rest)
+            // Brand images resolve against the static path. Unset ones stay
+            // empty so the templates keep their default look.
+            let brand_asset = |url: &str| -> serde_json::Value {
+                match url.strip_prefix("/static") {
+                    Some(rest) => format!("{}{}", static_path, rest).into(),
+                    None => url.into(),
+                }
+            };
+            let logo_mini = if brand.logo_mini_url.is_empty() {
+                &brand.logo_url
+            } else {
+                &brand.logo_mini_url
+            };
+            map.entry("site_logo")
+                .or_insert_with(|| brand_asset(&brand.logo_url));
+            map.entry("site_logo_mini")
+                .or_insert_with(|| brand_asset(logo_mini));
+            map.entry("favicon_url")
+                .or_insert_with(|| brand_asset(&brand.favicon_url));
+            map.entry("brand_login_background")
+                .or_insert_with(|| brand_asset(&brand.login_background_url));
+            map.entry("login_title")
+                .or_insert_with(|| brand.login_title.clone().into());
+            // Only a changed, plain color value recolors the theme palette.
+            map.entry("brand_primary_color").or_insert_with(|| {
+                let color = brand.primary_color.trim();
+                let plain = color.len() <= 64
+                    && color.chars().all(|c| {
+                        c.is_ascii_alphanumeric() || "#(),.% -".contains(c)
+                    });
+                if plain && !color.eq_ignore_ascii_case(crate::branding::DEFAULT_PRIMARY_COLOR) {
+                    color.into()
                 } else {
-                    brand.logo_url.clone()
-                })
+                    "".into()
+                }
             });
-            map.entry("site_logo_mini").or_insert_with(|| {
-                serde_json::Value::String(format!("{}/images/logo-mini.png", static_path))
-            });
-            map.entry("favicon_url").or_insert_with(|| {
-                serde_json::Value::String(if brand.favicon_url.is_empty() {
-                    format!("{}/images/favicon.png", static_path)
-                } else if let Some(rest) = brand.favicon_url.strip_prefix("/static") {
-                    format!("{}{}", static_path, rest)
-                } else {
-                    brand.favicon_url.clone()
-                })
-            });
+            // Raw CSS goes inside a <style> element; it must not close it.
+            map.entry("brand_custom_css")
+                .or_insert_with(|| brand.custom_css.replace("</", "<\\/").into());
             map.entry("demo_mode")
                 .or_insert_with(|| serde_json::Value::Bool(self.config().demo_mode));
             if let Some(ref alpine_js) = self.config.alpine_js {
@@ -725,6 +756,37 @@ impl ConsoleState {
         self.pending_reload.read().unwrap().clone()
     }
 
+    /// Snapshot of the active `[console.acl]`. Readers clone per request;
+    /// the reload path swaps it under the lock.
+    pub fn acl_config_snapshot(&self) -> ConsoleAclConfig {
+        self.acl_config.read().unwrap().clone()
+    }
+
+    /// Swap the active `[console.acl]`. Startup seeds it from `config`;
+    /// afterwards only `reload_acl_config` writes.
+    pub fn set_acl_config(&self, acl: ConsoleAclConfig) {
+        *self.acl_config.write().unwrap() = acl;
+    }
+
+    /// Re-read the configuration file and apply its `[console.acl]` section.
+    ///
+    /// The file is fully re-parsed before the swap: a malformed config
+    /// aborts the reload and leaves the running ACL untouched (fail-closed,
+    /// same contract as the proxy config reloads).
+    pub async fn reload_acl_config(&self, config_path: &str) -> Result<ConsoleAclConfig> {
+        let config = crate::config::Config::load_async(config_path)
+            .await
+            .context("failed to load configuration for console ACL reload")?;
+        // No `[console]` section at all: startup would have produced the
+        // default (loopback-only bootstrap), so the reload mirrors that.
+        let acl = config
+            .console
+            .map(|console| console.acl)
+            .unwrap_or_default();
+        self.set_acl_config(acl.clone());
+        Ok(acl)
+    }
+
     pub fn set_sip_server(&self, server: Option<SipServerRef>) {
         if let Ok(mut slot) = self.sip_server.write() {
             *slot = server;
@@ -876,7 +938,7 @@ impl ConsoleState {
     pub fn login_url(&self, next: Option<String>) -> String {
         let mut url = self.url_for("/login");
         if let Some(next) = next {
-            url.push_str(&format!("?next={}", next));
+            url.push_str(&next_query(&next));
         }
         url
     }
@@ -884,7 +946,7 @@ impl ConsoleState {
     pub fn register_url(&self, next: Option<String>) -> String {
         let mut url = self.url_for("/register");
         if let Some(next) = next {
-            url.push_str(&format!("?next={}", next));
+            url.push_str(&next_query(&next));
         }
         url
     }
@@ -1321,4 +1383,119 @@ mod tests {
             "unmatched host must not render the tenant brand"
         );
     }
+
+    #[tokio::test]
+    async fn brand_settings_reach_console_and_login_pages() {
+        use crate::branding::{BrandContext, BrandingProvider};
+        use std::sync::Arc as StdArc;
+
+        struct FullBranding;
+
+        impl BrandingProvider for FullBranding {
+            fn brand(&self) -> BrandContext {
+                BrandContext {
+                    site_name: "Acme PBX".to_string(),
+                    logo_url: "https://cdn.example.com/acme-logo.png".to_string(),
+                    favicon_url: "https://cdn.example.com/acme.ico".to_string(),
+                    primary_color: "#e11d48".to_string(),
+                    login_background_url: "https://cdn.example.com/acme-bg.jpg".to_string(),
+                    login_title: "Welcome to Acme".to_string(),
+                    custom_css: ".acme-marker { color: red; }</style>".to_string(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        async fn login_page(app: axum::Router, base_path: &str) -> String {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{base_path}/login"))
+                        .body(Body::empty())
+                        .expect("build login request"),
+                )
+                .await
+                .expect("login request");
+            response_body(response).await
+        }
+
+        let state = setup_state().await;
+        let app = router(state.clone());
+
+        // Without a brand, pages keep the stock palette and no brand images.
+        let plain = login_page(app.clone(), state.base_path()).await;
+        assert!(!plain.contains("--brand-primary"));
+        assert!(!plain.contains("rel=\"icon\""));
+
+        state.set_test_branding_provider(Some(StdArc::new(FullBranding)));
+        let html = login_page(app, state.base_path()).await;
+        for expected in [
+            "--brand-primary: #e11d48",
+            ".acme-marker { color: red; }",
+            "acme-logo.png",
+            "acme.ico",
+            "acme-bg.jpg",
+            "Welcome to Acme",
+        ] {
+            assert!(html.contains(expected), "login page should render {expected}");
+        }
+        assert!(
+            !html.contains("red; }</style>"),
+            "custom CSS must not close its style element"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_url_keeps_next_as_one_encoded_parameter() {
+        let state = setup_state().await;
+        assert_eq!(
+            state.login_url(Some("/console/e911?tab=report&page=2".to_string())),
+            "/console/login?next=%2Fconsole%2Fe911%3Ftab%3Dreport%26page%3D2"
+        );
+        assert_eq!(state.login_url(None), "/console/login");
+    }
+
+    /// Logged out on a nested page with a query: redirected to login, and
+    /// after logging in, back to the same page and query.
+    #[tokio::test]
+    async fn login_returns_to_the_nested_page_and_query() {
+        let state = setup_state().await;
+        state
+            .create_user("admin@example.com", "admin", "password123")
+            .await
+            .expect("seed admin user");
+        let app = router(state.clone());
+        let page = format!("{}/extensions/new?from=test&step=2", state.base_path());
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&page).body(Body::empty()).unwrap())
+            .await
+            .expect("page request");
+        assert!(response.status().is_redirection());
+        let login = response.headers()[header::LOCATION].to_str().unwrap().to_string();
+        assert_eq!(
+            login,
+            format!(
+                "{}/login?next={}",
+                state.base_path(),
+                urlencoding::encode(&page)
+            )
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&login)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("identifier=admin&password=password123"))
+                    .unwrap(),
+            )
+            .await
+            .expect("login request");
+        assert!(response.status().is_redirection());
+        assert_eq!(response.headers()[header::LOCATION].to_str().unwrap(), page);
+    }
 }
+

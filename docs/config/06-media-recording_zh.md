@@ -123,6 +123,25 @@ Console 入口：*中继 → 媒体选项 → ICE-Lite*（存储为 `metadata.sb
 | 对已探测主叫 opt-out | 关 | `false` | 是 | 关闭（中继优先） |
 | 全局开启 | `true` | — | — | 所有 RTP 腿带 `a=ice-lite` |
 
+### 自定义 SDP 属性透传（`passthrough_custom_sdp_attrs`）
+
+中继对端常在 SDP offer/answer 中携带厂商自定义属性（如 `a=x-switch-context`、`a=carrier-id`）。默认（不配置）rustpbx 把这些**非标准 `a=` 属性跨 B2BUA 重写双向透传**：主叫 INVITE 里的属性出现在发给中继的 INVITE 上，中继应答里的属性出现在回给主叫的 200 OK 上。媒体段级属性留在对应媒体段（按 `a=mid` 匹配，无 mid 时按段顺序回退）；会话级属性保持会话级。标准属性（`rtpmap`、`fmtp`、`ice-*`、`candidate`、方向属性等）不受本开关影响，遵循各自的 RFC 语义。
+
+按中继关闭（`passthrough_custom_sdp_attrs = false`）的两个典型动机：
+
+- 对端解析器严格，遇到未知 SDP 行直接拒呼。
+- 内部属性名不允许泄露给对端（或反向）。
+
+关闭对该中继**双向生效**：它自己的自定义属性不出向对端，它收到的 SDP 也不带对端的属性。来源与目标中继取 AND——只要经过的任一中继关闭，整条呼叫链路剥离。
+
+```toml
+[proxy.trunks.strict-pstn]
+dest = "sip:pstn.example.com:5060"
+passthrough_custom_sdp_attrs = false   # 默认（不设置）= 透传
+```
+
+Console：存储为 `metadata.sbc.passthrough_custom_sdp_attrs`。
+
 ### 选择合适的组合（Bug 1 + 2 场景）
 
 | 场景 | 服务器 `media_proxy` | 中继 `media_mode` | 中继 `external_ip` | 结果 |
@@ -226,7 +245,17 @@ callee_deny = ["911"]
 # Recording quality
 samplerate = 16000      # Resampled 16-bit PCM WAV output rate (Hz); optional
 ptime = 20              # File-recorder flush interval (ms); default 500
-stereo_swap = false     # true: callee left, caller right (stereo only)
+# 立体声声道分配（仅立体声录音生效）：
+#   caller_left   （默认）主叫 → 左声道，被叫 → 右声道
+#   callee_left             被叫 → 左声道，主叫 → 右声道
+#   external_left           外部用户 → 左声道，内部 → 右声道；
+#                           无法区分（双方同域/内部互拨）时回退主叫在左
+#   external_right          外部用户 → 右声道，内部 → 左声道（external_left
+#                           的镜像）；无法区分时回退主叫在右
+# stereo_mode = "external_left"
+# 已废弃的直接交换开关（true 等价 callee_left）；仅在任何层级都未配置
+# stereo_mode 时生效：
+# stereo_swap = false
 
 # Hybrid mode: force legacy WAV recorder even when [sipflow] is active
 # When true, SipFlow captures signalling only; [recording] handles media
@@ -247,7 +276,7 @@ directions = ["inbound"]
 auto_start = true
 ```
 
-这些文件录音设置也适用于按需录音，单次通话的设置优先于服务器录音策略。显式设置 `samplerate`（8000–192000 Hz）时，输出重采样后的 16 位 PCM WAV；省略时保留按编码器选择的 WAV 格式。`ptime` 必须大于零，仅控制文件刷新间隔，不改变 RTP 打包间隔。这些设置不影响 SipFlow 报文采集。
+这些文件录音设置也适用于按需录音，单次通话的设置优先于服务器录音策略。显式设置 `samplerate`（8000–192000 Hz）时，输出重采样后的 16 位 PCM WAV；省略时保留按编码器选择的 WAV 格式。`ptime` 必须大于零，仅控制文件刷新间隔，不改变 RTP 打包间隔。`stereo_mode = "external_left"` 将外部用户放在立体声录音的左声道（`external_right` 为镜像，放在右声道）——按入中继上下文、呼叫方向（由 realm 推导）与外呼拓扑逐通话判定——无法区分（双方均为内部或均为外部）时分别回退主叫在左 / 主叫在右。这些设置不影响 SipFlow 报文采集（sipflow 录音在采集阶段交换 leg 实现 `stereo_mode`，导出结果一致）。
 
 ### HTTP 录音上传
 
@@ -314,6 +343,46 @@ bucket = "test2"
 - console 录音页下载/回放对每个桶分别预签名，无需额外配置。
 - 上传失败的 `.upload_failed.*` 标记记录了来源标签，重试时仍写回各自的桶。
 - 配置支持热更新（console 保存或重载配置后所有桶的 Storage 自动重建）。
+
+### 视频通话录制（`[recording.video]`）
+
+启用后，凡是 SDP 协商出 **H264** 视频 m-line 的通话（需
+`video_policy = "pass_through"` 让视频留在媒体路径上），会在音频工件之外
+**逐腿录制独立的 MP4 文件**：
+
+- `{base}_caller.mp4` / `{base}_callee.mp4` —— 每条腿一个文件，内容恰为该
+  腿发出的媒体（与立体声 WAV 的逐声道约定一致）。
+- 录制从**第一个关键帧（IDR）**开始：通话中途启动录制会等待下一个自然 IDR
+  （通常远小于一个 GOP，约 1–2 秒），丢弃 IDR 之前的帧，保证文件从首个
+  采样起即可解码。
+- MP4 文件与音频 WAV 走完全相同的生命周期：CDR `recorder[]` 分段（携带
+  `media_kind = "video"`）、`recording_metadata_available` 事件、控制台
+  通话详情页（逐腿视频播放器），以及上传钩子 —— S3/OSS/HTTP 上传按扩展名
+  设置 `content-type: video/mp4`，按来源分桶（`[recording.sources.*]`）对
+  伴生文件同样生效。
+- 控制台回放端点支持 HTTP Range 流式播放
+  （`GET /call-records/{id}/recording?segment={unique_id}`）。
+
+范围说明：
+
+- **音频仍在 WAV 工件中** —— MP4 仅含视频轨。这是刻意的生态约束：纯 Rust
+  生态没有支持 Opus 的 MP4 封装器，也没有成熟的纯 Rust AAC 编码器，
+  而 RustPBX 默认不引入新的 C 依赖。
+- **仅协商 VP8 的通话**降级为纯音频 WAV（每次呼叫告警一次）。VP9/WebM
+  属后续工作。
+- 丢包只影响个别帧（解码器跳到下一个 IDR），不会损坏文件；视频抓包队列
+  饱和时按计数丢弃，音频录制永不因视频而饥饿。
+
+```toml
+[recording]
+enabled = true
+type = "s3"
+bucket = "recordings"
+
+[recording.video]
+enabled = true
+codec = "h264"   # 目前仅支持 h264；VP8 通话回退纯音频
+```
 
 ### 外呼回铃段录音（record_ringing）
 

@@ -3,6 +3,10 @@
 # cargo run . --bin rustpbx --conf config.toml
 
 http_addr = "0.0.0.0:8080"
+# Explicit node identity override. When unset the identity falls back to the
+# cluster peer self-match, then the system hostname. (Replaces the former
+# RUSTPBX_INSTANCE_ID environment variable.)
+# instance_id = "pbx-node-1"
 # Trust X-Forwarded-For / X-Real-IP / X-Forwarded-Proto headers when deriving
 # the client IP and request scheme. Only enable when RustPBX sits behind a
 # reverse proxy that overwrites these headers — otherwise any caller can spoof
@@ -18,6 +22,9 @@ log_level = "info"
 # for loss/load diagnostics without Prometheus). Empty/unset disables.
 #stats_log = "/var/log/rustpbx.stats.log"
 #stats_interval = 5
+# Seconds between rustpbx_cdr_daily rollups (feeds the console's daily trunk
+# report). 0 disables it.
+#cdr_rollup_interval = 300
 # Paths can include a trailing * to skip whole subtrees
 # http_access_skip_paths = ["/health", "/metrics*"]
 # SQLite database (default)
@@ -70,6 +77,20 @@ database_url = "sqlite://rustpbx.sqlite3"
 # registered with `;+sip.ice` are answered as ICE-lite automatically.
 # ice_lite = false
 
+# Optional per-bridge sliding diagnostics, separate from the 5s global stats log.
+# Rates use actual elapsed counter deltas; fresh RTCP reports describe remote reception.
+# Missing samples stay unavailable. Coalesced report counts disclose sampling limits.
+# [media.quality_stats]
+# enabled = false
+# sample_interval_ms = 500  # Valid: 250..10000; absent defaults to 5000.
+# window_ms = 2000          # Valid: sample interval..60000; absent defaults to 10000.
+# log_interval_ms = 2000    # Valid: 2000..60000; absent defaults to 10000.
+# Optional egress PCM energy before encoding; no extra decode on RTP direct forwarding.
+# RMS and peak use raw signed 16-bit PCM units. Attenuation is dBov: 0 loudest, 127 silence.
+# Window average uses sample-weighted energy, not an average of decibel values.
+# [media.volume_stats]
+# enabled = false
+
 # SIP Contact — host in Contact for dialogs (BYE, re-INVITE). Unset → follow external_ip.
 # sip_external_ip = "203.0.113.10"
 # auto_sip_external_ip = "http://ifconfig.me"
@@ -113,17 +134,26 @@ database_url = "sqlite://rustpbx.sqlite3"
 # For temporary TURN credentials, use secrete instead of credential.
 # Credentials use Base64(HMAC-SHA1(secrete, "<expiry>:<username>")).
 # Use the same secret as miuturn's [auth].secret, with use_auth_secret = true.
-# Each entry may have its own secret/lifetime.
+# Each entry may have its own secret/lifetime/encoding.
+# encoding = "hex" switches the password to hex(HMAC-SHA1(...)), the format
+# miuturn verifies (default "base64" matches coturn's TURN REST API).
 # Shared-secret entries are browser-only; static entries also apply to PBX RTP.
 # [[ice_servers]]
 # urls = ["turn:turn.example.com:3478", "turn:turn.example.com:3478?transport=tcp"]
 # secrete = "replace-with-the-same-private-secret-as-miuturn"
 # username = "rustpbx" # user-id suffix, must not contain ':'; default: rustpbx
 # lifetime = 3600 # seconds; clients must fetch fresh credentials before expiry
+# encoding = "hex" # "base64" (coturn, default) or "hex" (miuturn)
 
-# Shared SIP and HTTP AMI cluster peers.
+# Shared SIP and HTTP AMI cluster. The peers list is the full mesh
+# manifest: it must include THIS node's own entry (matched against the
+# local listener to resolve this node's cluster address, which arms the
+# home-hop fork guard and stamps registration home_proxy) AND each peer.
 # [cluster]
-# peers = [{ addr = "10.0.0.2", sip_port = 5060, ami_port = 8080 }]
+# peers = [
+#     { addr = "10.0.0.1", sip_port = 5060, ami_port = 8080 }, # this node
+#     { addr = "10.0.0.2", sip_port = 5060, ami_port = 8080 },
+# ]
 
 [console]
 #session_secret = "please_change_me_to_a_random_secret"
@@ -139,6 +169,19 @@ require_mfa = false
 secure_cookie = false
 # Static files HTTP path prefix (default: "/static")
 static_path = "/static"
+# Source-address ACL for the console. "bootstrap" limits which client
+# addresses may create the FIRST (superuser) account on the unauthenticated
+# /register page; when omitted only loopback (127.0.0.1 / ::1) may bootstrap.
+# "registration" optionally restricts the whole /register endpoint (bootstrap
+# and self-registration alike). Entries support exact IPs, CIDR ranges, and
+# "*"; an explicit list replaces the loopback default. Behind a trusted
+# reverse proxy (trust_forward_headers = true) the forwarded client address
+# is evaluated.
+# [console.acl]
+# bootstrap = ["127.0.0.1", "::1", "192.168.1.0/24"]
+# registration = ["10.0.0.0/8"]
+# Apply edits without a restart: POST /ami/v1/reload/console_acl
+# (a malformed config aborts the reload with 422 and keeps the current ACL).
 
 [ami]
 # AMI access allow list. Supports exact IPs, CIDR ranges, and "*".
@@ -166,6 +209,25 @@ ws_handler= "/ws"
 ami_path = "/ami/v1"
 ice_servers_path = "/iceservers"
 media_proxy = "auto"
+
+# Global session id (RFC 7989 correlation id shared by every leg of a call,
+# also the CDR `call_id`/`session_id` key).
+# Length in hex chars of freshly generated ids. Range 8..=32; the default 32
+# mirrors the legacy UUID v4 simple form. Set 16 for short ids (64-bit random).
+# session_id_length = 32
+# Wire format of the outgoing SIP `Session-ID` header:
+#   "native"  = stamp the internal id verbatim (ids shorter than 32 hex are
+#               not strictly RFC 7989 shaped — strict peers discard the header
+#               and fall back to Call-ID correlation; same-version peers and
+#               cluster nodes inherit it normally)
+#   "rfc7989" = zero-pad the id to 32 hex chars so the header always satisfies
+#               the RFC's UUID shape
+# session_id_header_mode = "native"
+# Reuse id-shaped incoming SIP Call-IDs (32 hex or the configured length) as
+# the session id. false = only `Session-ID` headers inherit; every originate
+# gets a fresh id (removes forked-INVITE / spoofed-Call-ID collision risk at
+# the cost of correlation with legacy upstreams).
+# session_id_inherit_callid = true
 
 # Direct extension-to-extension (P2P) calls: when a callee has multiple
 # registered devices, ring ALL of them in parallel (first to answer wins).
@@ -322,8 +384,14 @@ type = "extension"
 # chain accepts SSO tokens without extra plumbing:
 #   X-Auth-Token on REGISTER, ?token= on the WebSocket URL.
 
-# Audio codec allowlist (e.g. PCMU, PCMA, G722, OPUS).
-# audio_codecs = ["pcma","pcmu","g722","opus"]
+# Audio codec allowlist (e.g. PCMU, PCMA, G722, OPUS, G729).
+#
+# Honored on EVERY leg — including WebRTC/WSS agent legs — and its ORDER is the
+# offer preference order (the first entry both peers support wins). Listing
+# `g729` here advertises G729 to WebRTC clients too; clients that cannot decode
+# it (browsers) simply do not select it, so it is safe for mixed fleets. When
+# unset, per-transport defaults apply (the WebRTC default excludes G729).
+# audio_codecs = ["g729","pcma","pcmu","g722","opus"]
 
 # Video codec allowlist for pass-through relay. Only codecs present in the
 # peer's SDP are retained; this setting does not create a video section.
@@ -365,6 +433,24 @@ type = "extension"
 enabled = true
 auto_start = true
 auto_start_at = "media" # default; use "answer" to wait for 200
+# Delete the WAV recording of a call that was never answered (early media
+# only) instead of keeping and uploading it.
+# discard_unanswered = false
+# Stereo channel assignment for two-party stereo recordings:
+#   caller_left   (default) caller → left, callee → right
+#   callee_left             callee → left, caller → right
+#   external_left           external party → left, internal → right; when the
+#                           sides cannot be distinguished (internal-to-internal
+#                           or both external) the caller stays on the left.
+#   external_right          external party → right, internal → left; the mirror
+#                           of external_left, falling back to caller-right when
+#                           the sides cannot be distinguished.
+# Applies to file recordings (local/http/s3) and to sipflow RTP capture
+# (capture-time leg swap, so exports inherit it).
+# stereo_mode = "external_left"
+# Deprecated direct swap; true ≡ callee_left. Honoured only when no layer
+# configures stereo_mode.
+# stereo_swap = false
 # Routed applications exempt from auto recording (only meaningful with
 # auto_start = true). With ["ivr"], IVR-routed calls install no auto recorder;
 # the IVR flow records only via its smart-node `record start`, so the IVR
@@ -408,6 +494,14 @@ auto_start_at = "media" # default; use "answer" to wait for 200
 # retry_max_attempts = 30
 # upload_sla_secs = 600      # 10-minute completion SLA
 #
+# Keep the local WAV for N days after a successful upload before cleanup
+# (acceptance §3.2.5 归档: 上传后本地保留 10 天). 0 = delete immediately on
+# upload success (historical behaviour). The retention sweep runs on the
+# retry worker cycle and never touches files still pending retry (failure
+# marker present). Applies to http/s3 uploads only — local/sipflow
+# deployments manage disk retention themselves.
+# keep_local_days = 10
+#
 # type = "local" archival layout under path:
 # subdir = "daily"   # default — {path}/YYYYMMDD/{file}
 # # subdir = "hourly"  # {path}/YYYYMMDD/HH/{file}
@@ -442,6 +536,23 @@ auto_start_at = "media" # default; use "answer" to wait for 200
 # bucket = "test1"
 # [recording.sources.ringing]
 # bucket = "test2"
+#
+# Video call recording ([recording.video], P2P per-leg MP4):
+# When enabled, a call whose negotiated SDP carries an H264 video m-line
+# additionally records each leg's video as `{base}_caller.mp4` /
+# `{base}_callee.mp4` next to the WAV artifact. The MP4 files ride the same
+# lifecycle as the audio WAV: CDR segments (media_kind = "video"),
+# console playback/download (per-leg players on the call-record detail
+# page), and upload hooks (S3/OSS/HTTP — content-type video/mp4 is set
+# per extension). Requires `video_policy = "pass_through"` and H264 video
+# negotiation; VP8-only calls record audio only.
+# Companion artifacts share the audio segment's upload target
+# ([recording.sources.*] keyed by segment type applies unchanged).
+# Note: recording starts at the first keyframe, so a mid-call start waits
+# for the next IDR (typically well under one GOP, ~1-2s).
+# [recording.video]
+# enabled = true
+# codec = "h264"                # only h264 today (VP8 → audio-only fallback)
 #
 # HTTP mode: a generic, configurable multipart uploader. Defaults preserve the
 # historical wire format (POST, multipart field "recording", file name = local
@@ -623,12 +734,27 @@ subdirs = "daily"  # "none" | "daily" | "hourly"
 #                                       # Console: Media Options → ICE-Lite). For strict full-ICE
 #                                       # peers (Teams Direct Routing) that never fall back to
 #                                       # plain RTP. false = explicitly off; unset = inherit global.
-# # Forward original custom headers to this trunk's outgoing INVITE.
-# # Unset (default) -> forward nothing; internal destinations forward everything.
+# passthrough_custom_sdp_attrs = true   # custom (non-standard) SDP a= attributes cross the B2BUA
+#                                       # (default). false strips them in both directions for this
+#                                       # trunk: its vendor attrs never reach the peer, and SDP
+#                                       # sent to it carries none from the other side. Source and
+#                                       # destination trunks AND together — one disabled trunk
+#                                       # disables pass-through for the whole call.
+# nat_fix = false                       # per-trunk override of [proxy] nat_fix for SIP messages
+#                                       # from this trunk's IPs (inbound_hosts/dest/backup_dest).
+# # Custom headers (X-* / P-* that are not standard SIP headers) copied between
+# # the call legs when calls go to this trunk, in both directions: the caller's
+# # INVITE headers onto this trunk's INVITE, and this trunk's 18x/200 headers
+# # back onto the caller's responses. Standard SIP headers (Require, Identity,
+# # P-Asserted-Identity, ...) are never copied.
+# # Unset (default) -> copy nothing. Internal destinations copy all custom
+# # headers, both ways.
 # # Applies to all callee legs (direct dial, fork, queue agents, transfers,
-# # app-originated legs). Standard SIP headers are never forwarded.
+# # app-originated legs). List entries ending in `*` match by prefix.
+# # Console: Header Passthrough section.
 # # header_passthrough = { mode = "all" }
 # # header_passthrough = { mode = "whitelist", whitelist = ["X-Smart2Agent", "X-SmartParams"] }
+# # header_passthrough = { mode = "whitelist", whitelist = ["P-Early-Media", "X-*"] }
 # # header_passthrough = { mode = "blacklist", blacklist = ["X-Token"] }
 
 # Per-trunk ringback / early-media tones. Each value is an audio file path or a

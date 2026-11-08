@@ -33,11 +33,115 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
 
-/// Type alias for mock call stack command sender.
-pub type MockCmdTx = tokio::sync::mpsc::UnboundedSender<CallCommand>;
 /// Type alias for mock call stack command receiver.
 pub type MockCmdRx = tokio::sync::mpsc::Receiver<CallCommand>;
+
+/// Minimal [`ApplicationContext`] for tests: session `"test-session"`, inbound
+/// call from `caller` to `callee`, no DB, default config.
+pub fn test_context_for(caller: &str, callee: &str) -> ApplicationContext {
+    test_context_with_config(caller, callee, Arc::new(Config::default()))
+}
+
+/// [`test_context_for`] with the conventional fixture identity
+/// (caller `"1001"`, callee `"2000"`).
+pub fn test_context() -> ApplicationContext {
+    test_context_for("1001", "2000")
+}
+
+/// [`test_context_for`] with a specific [`Config`] (e.g. proxy settings
+/// parsed from TOML in queue tests).
+pub fn test_context_with_config(
+    caller: &str,
+    callee: &str,
+    config: Arc<Config>,
+) -> ApplicationContext {
+    ApplicationContext::new(
+        DatabaseConnection::default(),
+        CallInfo {
+            session_id: "test-session".into(),
+            caller: caller.into(),
+            callee: callee.into(),
+            direction: "inbound".into(),
+            started_at: Utc::now(),
+            sip_headers: HashMap::new(),
+            route_name: None,
+        },
+        config,
+        reqwest::Client::new(),
+    )
+}
+
+/// In-memory [`std::io::Write`] sink that captures tracing output for log
+/// assertions. Clone it freely — all clones share the same buffer.
+#[derive(Clone)]
+pub struct MemoryLogWriter(pub Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl MemoryLogWriter {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    /// Full captured log text.
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Default for MemoryLogWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::io::Write for MemoryLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Build a `tracing` fmt subscriber writing into `writer` (no timestamps,
+/// no ANSI). Wrap the returned subscriber in `set_default` / `with_default`
+/// as the caller requires.
+pub fn log_capture_subscriber(
+    writer: MemoryLogWriter,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    let w = writer.clone();
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || w.clone())
+        .finish()
+}
+
+/// Spawn a one-shot axum HTTP server that answers every method on `path`
+/// with the static JSON `body`. Returns the full URL. Test scaffolding
+/// shared by the IVR webhook/provider suites.
+pub async fn spawn_static_json_server(path: &str, body: serde_json::Value) -> String {
+    use axum::{Json, Router, routing::any};
+
+    let router = Router::new().route(
+        path,
+        any(move || {
+            let body = body.clone();
+            async move { Json(body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock server");
+    let addr = listener.local_addr().unwrap();
+    crate::utils::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    format!("http://{}:{}{}", addr.ip(), addr.port(), path)
+}
 
 /// Fully assembled, in-memory [`CallApp`] harness — no SIP stack required.
 ///
@@ -71,29 +175,32 @@ impl MockCallStack {
     /// * `caller` – Simulated caller-ID (e.g. `"1001"` or `"sip:alice@test"`).
     /// * `callee` – Simulated callee-ID (e.g. `"1002"`).
     pub fn run(app: Box<dyn CallApp>, caller: &str, callee: &str) -> Self {
-        // Minimal ApplicationContext (no DB, no storage).
-        let ctx = ApplicationContext::new(
-            DatabaseConnection::default(),
-            CallInfo {
-                session_id: "test-session".into(),
-                caller: caller.into(),
-                callee: callee.into(),
-                direction: "inbound".into(),
-                started_at: Utc::now(),
-                sip_headers: HashMap::new(),
-                route_name: None,
-            },
-            Arc::new(Config::default()),
-            reqwest::Client::new(),
-        );
-
-        Self::run_with_context(app, ctx)
+        Self::run_with_context(app, test_context_for(caller, callee))
     }
 
     pub fn run_with_context(app: Box<dyn CallApp>, ctx: ApplicationContext) -> Self {
         // Real SipSessionHandle — backed only by channels, no SIP socket.
+        let (session_tx, mut session_rx) = mpsc::channel(256);
+        let handle = SipSessionHandle::new_for_test("test-session", session_tx);
+        // Request/reply probes are answered here so the app never waits on
+        // the test reading its commands; everything else is forwarded.
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
-        let handle = SipSessionHandle::new_for_test("test-session", cmd_tx);
+        crate::utils::spawn(async move {
+            while let Some(cmd) = session_rx.recv().await {
+                match cmd {
+                    // No offline targets in the mock stack: every probe
+                    // reports the target as reachable.
+                    CallCommand::ProbeOfflineTarget { target: _, reply } => {
+                        let _ = reply.send(false);
+                    }
+                    other => {
+                        if cmd_tx.send(other).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
 
         // Synthetic event channel: test → controller.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<ControllerEvent>();
@@ -104,7 +211,7 @@ impl MockCallStack {
         let cancel = CancellationToken::new();
         let event_loop = AppEventLoop::new(app, controller, ctx, cancel.child_token(), timer_rx);
 
-        let join_handle = crate::utils::spawn(event_loop.run());
+        let join_handle = crate::utils::spawn(event_loop.run().with_current_subscriber());
 
         Self {
             event_tx,

@@ -98,6 +98,10 @@ impl ObservabilityAddon {
                 ),
                 &[1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0],
             )?
+            // `rustpbx_cc_*` histogram buckets: these metrics are RECORDED by
+            // the contact-center addon (rustpbx-cc), not by core — the bucket
+            // registration lives here because it must precede the exporter's
+            // first scrape regardless of whether the addon is loaded.
             .set_buckets_for_metric(
                 metrics_exporter_prometheus::Matcher::Full(
                     "rustpbx_cc_queue_wait_time_seconds".to_string(),
@@ -228,6 +232,11 @@ impl Addon for ObservabilityAddon {
 
     fn id(&self) -> &'static str {
         "observability"
+    }
+
+    fn has_console_pages(&self) -> bool {
+        // Serves /metrics and /healthz only.
+        false
     }
 
     fn name(&self) -> &'static str {
@@ -555,42 +564,6 @@ mod tests {
                 .any(|l| l.starts_with("rustpbx_call_duration_seconds_bucket")
                     && l.contains("le=\"180\"")),
             "custom call-duration buckets not applied"
-        );
-    }
-
-    /// Core `metrics::cc::agent_status_changed` must zero the previous
-    /// (agent, status) series — otherwise one agent counts as being in
-    /// several states at once (Prometheus series never expire). Lives here
-    /// because asserting on rendered output requires this addon's recorder;
-    /// core must not depend on addon code, even in tests.
-    #[test]
-    fn test_agent_status_transition_zeroes_previous() {
-        ObservabilityAddon::install_recorder().ok();
-        crate::metrics::cc::agent_status_changed("metrics-test-agent", "idle");
-        crate::metrics::cc::agent_status_changed("metrics-test-agent", "busy");
-
-        let Some(text) = ObservabilityAddon::render_prometheus() else {
-            return; // recorder without render handle; nothing to assert
-        };
-        let line_for = |status: &str| {
-            text.lines()
-                .find(|l| {
-                    l.starts_with("rustpbx_cc_agent_status")
-                        && l.contains("agent=\"metrics-test-agent\"")
-                        && l.contains(&format!("status=\"{status}\""))
-                })
-                .unwrap_or_else(|| panic!("missing series for status={status}"))
-                .to_string()
-        };
-        assert!(
-            line_for("idle").ends_with(" 0"),
-            "previous status must be zeroed, got: {}",
-            line_for("idle")
-        );
-        assert!(
-            line_for("busy").ends_with(" 1"),
-            "current status must be 1, got: {}",
-            line_for("busy")
         );
     }
 

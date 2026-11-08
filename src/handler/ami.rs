@@ -37,7 +37,10 @@ pub fn ami_router(app_state: AppState) -> Router<AppState> {
         .route("/reload/trunks", post(reload_trunks_handler))
         .route("/trunk_registrations", get(trunk_registrations_handler))
         .route("/reload/routes", post(reload_routes_handler))
-        .route("/reload/acl", post(reload_acl_handler))
+        .route("/reload/acl", post(reload_acl_handler));
+    #[cfg(feature = "console")]
+    let r = r.route("/reload/console_acl", post(reload_console_acl_handler));
+    let r = r
         .route("/reload/app", post(reload_app_handler))
         .route("/reload/queues", post(reload_queues_handler))
         .route("/reload/ivr", post(reload_ivr_handler))
@@ -67,35 +70,37 @@ pub fn ami_router(app_state: AppState) -> Router<AppState> {
     };
 
     #[cfg(feature = "commerce")]
-    let r = {
-        let r = r
-            .route("/cluster/ping", post(cluster_ping_handler))
-            .route("/cluster/reload_config", get(cluster_reload_config_handler))
-            .route("/cluster/reload_sync", post(cluster_reload_sync_handler))
-            .route(
-                "/cluster/evaluate_route",
-                post(cluster_evaluate_route_handler),
-            )
-            .route(
-                "/cluster/dispatch_command",
-                post(cluster_dispatch_command_handler),
-            )
-            .route("/cluster/forward_sip", post(cluster_forward_sip_handler))
-            .route(
-                "/cluster/show_session/{session_id}",
-                get(cluster_show_session_handler),
-            )
-            .route(
-                "/cluster/session_owner/{call_id}",
-                get(cluster_session_owner_handler),
-            )
-            .route("/cluster/list_calls", get(cluster_list_calls_handler))
-            .route("/cluster/logs/recent", get(cluster_logs_recent_handler))
-            .route("/cluster/logs/follow", get(cluster_logs_follow_handler));
-        // Addon-owned AMI routes (e.g. CC `/cluster/cc_owner_op`) — core stays
-        // free of addon path knowledge.
-        r.merge(app_state.addon_registry.get_ami_routes(app_state.clone()))
-    };
+    let r = r
+        .route("/cluster/ping", post(cluster_ping_handler))
+        .route("/cluster/reload_config", get(cluster_reload_config_handler))
+        .route("/cluster/reload_sync", post(cluster_reload_sync_handler))
+        .route(
+            "/cluster/evaluate_route",
+            post(cluster_evaluate_route_handler),
+        )
+        .route(
+            "/cluster/dispatch_command",
+            post(cluster_dispatch_command_handler),
+        )
+        .route("/cluster/forward_sip", post(cluster_forward_sip_handler))
+        .route(
+            "/cluster/show_session/{session_id}",
+            get(cluster_show_session_handler),
+        )
+        .route(
+            "/cluster/session_owner/{call_id}",
+            get(cluster_session_owner_handler),
+        )
+        .route("/cluster/list_calls", get(cluster_list_calls_handler))
+        .route("/cluster/logs/recent", get(cluster_logs_recent_handler))
+        .route("/cluster/logs/follow", get(cluster_logs_follow_handler))
+        .route("/cluster/logs/search", get(cluster_logs_search_handler));
+    // Addon-owned AMI routes (e.g. CC `/cc/admin_cmd` collect-logs/screenshot,
+    // `/cluster/cc_owner_op`) — core stays free of addon path knowledge.
+    // NOT commerce-gated: any enabled addon may contribute routes (the trait
+    // default contributes none), and the cc console needs them in plain
+    // `contact-center` builds too.
+    let r = r.merge(app_state.addon_registry.get_ami_routes(app_state.clone()));
 
     // Cluster event sync endpoints (AMI HTTP replaces old SIP MESSAGE).
     // NOT commerce-gated: the broadcast side initializes for ANY build with
@@ -137,6 +142,10 @@ pub fn ami_router(app_state: AppState) -> Router<AppState> {
 
     let r = r.layer(middleware::from_fn_with_state(
         app_state.clone(),
+        crate::rolling::ami_forward_middleware,
+    ));
+    let r = r.layer(middleware::from_fn_with_state(
+        app_state.clone(),
         crate::handler::middleware::ami_auth::ami_auth_middleware,
     ));
     Router::new().nest(&ami_path, r).with_state(app_state)
@@ -168,23 +177,13 @@ pub(super) async fn health_handler(State(state): State<AppState>) -> Response {
             "total".to_string(),
             serde_json::json!(crate::utils::active_task_count()),
         );
-        let metrics = crate::utils::task_metrics_snapshot();
-        if !metrics.is_empty() {
-            let sorted: std::collections::BTreeMap<usize, Vec<String>> = {
-                let mut m: std::collections::BTreeMap<usize, Vec<String>> =
-                    std::collections::BTreeMap::new();
-                for (loc, cnt) in &metrics {
-                    m.entry(*cnt).or_default().push(loc.clone());
-                }
-                m
-            };
-            let mut entries = Vec::new();
-            for (cnt, locs) in sorted.iter().rev() {
-                for loc in locs {
-                    entries.push(serde_json::json!({"loc": loc, "count": cnt}));
-                }
-            }
-            map.insert("by_location".to_string(), serde_json::json!(entries));
+        // Flat "spawn location: live task count" entries — sorted by count
+        // descending so the hottest spawn sites read first.
+        let mut metrics: Vec<(String, usize)> =
+            crate::utils::task_metrics_snapshot().into_iter().collect();
+        metrics.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (loc, count) in metrics {
+            map.insert(loc, serde_json::json!(count));
         }
         map
     };
@@ -199,6 +198,12 @@ pub(super) async fn health_handler(State(state): State<AppState>) -> Response {
         "dialogs": sip.inner.dialog_layer.len(),
         "calls": sip.inner.active_call_registry.count(),
         "running_tx": sip.inner.runnings_tx.load(Ordering::Relaxed),
+        "transport_connections": sip
+            .inner
+            .endpoint
+            .inner
+            .transport_layer
+            .connections_count(),
         "leak": serde_json::json!({
             "handles_by_dialog": sip.inner.active_call_registry.handles_by_dialog_count(),
             "dialogs_by_session": sip.inner.active_call_registry.dialog_by_session_count(),
@@ -606,6 +611,59 @@ async fn reload_acl_handler(State(state): State<AppState>, client_ip: ClientAddr
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "status": "error",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Apply `[console.acl]` from the on-disk configuration to the running
+/// console (first-account bootstrap + registration source restrictions).
+/// The config file is re-parsed in full first: a malformed file aborts the
+/// reload with 422 and leaves the running ACL untouched (fail-closed, same
+/// contract as `load_proxy_config_override`).
+#[cfg(feature = "console")]
+async fn reload_console_acl_handler(
+    State(state): State<AppState>,
+    client_ip: ClientAddr,
+) -> Response {
+    info!(%client_ip, "Reload console ACL via /reload/console_acl endpoint");
+    let Some(console) = state.console.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "console is not running",
+            })),
+        )
+            .into_response();
+    };
+    let Some(path) = state.config_path.clone() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "status": "invalid",
+                "message": "no configuration file path configured",
+            })),
+        )
+            .into_response();
+    };
+
+    match console.reload_acl_config(&path).await {
+        Ok(acl) => Json(serde_json::json!({
+            "status": "ok",
+            "bootstrap": acl.bootstrap,
+            "registration": acl.registration,
+        }))
+        .into_response(),
+        Err(error) => {
+            warn!(%client_ip, error = %error, "console ACL reload failed");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "status": "invalid",
                     "message": error.to_string(),
                 })),
             )
@@ -2316,6 +2374,8 @@ async fn cluster_show_session_handler(
 
     Json(serde_json::json!({
         "data": {
+            "node": state.sip_server().inner.cluster_self_addr.as_ref().map(|addr| addr.to_string())
+                .unwrap_or_else(|| "local".to_string()),
             "meta": registry.get(&session_id),
             "state": handle.snapshot(),
         }
@@ -2382,9 +2442,22 @@ async fn cluster_list_calls_handler(
 #[derive(Deserialize, Default)]
 struct ClusterLogsQuery {
     #[serde(default)]
+    file_identity: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     position: Option<u64>,
+}
+
+#[cfg(feature = "commerce")]
+async fn cluster_logs_search_handler(
+    State(state): State<AppState>,
+    Query(query): Query<crate::log_viewer::SearchQuery>,
+) -> Response {
+    crate::log_viewer::search_response(
+        crate::log_viewer::log_file_path_from_config(state.config()),
+        query,
+    ).await
 }
 
 #[cfg(feature = "commerce")]
@@ -2394,8 +2467,11 @@ async fn cluster_logs_recent_handler(
 ) -> Response {
     let limit = crate::log_viewer::normalize_log_limit(query.limit);
     let path = crate::log_viewer::log_file_path_from_config(state.config());
-    match crate::log_viewer::recent_log_payload(path.as_deref(), limit) {
-        Ok(payload) => Json(payload).into_response(),
+    match crate::log_viewer::recent_log_payload(path.as_deref(), limit).await {
+        Ok(mut payload) => {
+            payload["logging"] = crate::log_viewer::logging_metadata_from_config(state.config());
+            Json(payload).into_response()
+        }
         Err(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "status": "error", "message": message })),
@@ -2409,10 +2485,15 @@ async fn cluster_logs_follow_handler(
     State(state): State<AppState>,
     Query(query): Query<ClusterLogsQuery>,
 ) -> Response {
+    if query.file_identity.as_deref().is_some_and(|identity| !crate::log_viewer::valid_file_identity(identity)) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "status": "error", "message": "Invalid log file identity",
+        }))).into_response();
+    }
     let position = query.position.unwrap_or(0);
     let limit = crate::log_viewer::normalize_log_limit(query.limit);
     let path = crate::log_viewer::log_file_path_from_config(state.config());
-    match crate::log_viewer::follow_log_payload(path.as_deref(), position, limit) {
+    match crate::log_viewer::follow_log_payload(path.as_deref(), position, limit, query.file_identity.as_deref()).await {
         Ok(payload) => Json(payload).into_response(),
         Err(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2976,6 +3057,76 @@ mod calls_query_tests {
 #[cfg(feature = "commerce")]
 mod cluster_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cluster_logs_recent_reports_owner_active_logging() {
+        use tower::ServiceExt;
+
+        for enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("runtime.log");
+            std::fs::write(&log, "owner-log-row\n").unwrap();
+            let app = crate::app::AppStateBuilder::new()
+                .with_config(crate::config::Config {
+                    database_url: "sqlite::memory:".into(),
+                    ami: Some(crate::config::AmiConfig::default()),
+                    log_file: Some(log.to_string_lossy().into_owned()),
+                    log_level: Some("debug".into()),
+                    media: Some(crate::config::MediaSection {
+                        quality_stats: crate::media::quality_stats::QualityStatsConfig {
+                            enabled,
+                            sample_interval_ms: 500,
+                            window_ms: 2000,
+                            log_interval_ms: 2000,
+                        },
+                        volume_stats: crate::media::volume_stats::VolumeStatsConfig { enabled },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .with_skip_sip_bind()
+                .build()
+                .await
+                .unwrap();
+            let router = ami_router(app.clone()).with_state(app);
+            for (ip, status) in [
+                ("203.0.113.42:8080", StatusCode::FORBIDDEN),
+                ("127.0.0.1:8080", StatusCode::OK),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/ami/v1/cluster/logs/recent?limit=1")
+                            .extension(axum::extract::ConnectInfo(
+                                ip.parse::<std::net::SocketAddr>().unwrap(),
+                            ))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status);
+                if status != StatusCode::OK {
+                    continue;
+                }
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(payload["lines"], serde_json::json!(["owner-log-row"]));
+                assert_eq!(payload["logging"]["quality_stats"]["enabled"], enabled);
+                assert_eq!(
+                    payload["logging"]["quality_stats"]["sample_interval_ms"],
+                    500
+                );
+                assert_eq!(payload["logging"]["volume_stats"]["enabled"], enabled);
+                assert_eq!(payload["logging"]["sipflow_configured"], false);
+                assert_eq!(payload["logging"]["log_level"], "debug");
+                assert_eq!(payload["logging"]["revision"], env!("GIT_COMMIT_HASH"));
+            }
+        }
+    }
 
     #[test]
     fn test_deserialize_ping_payload_single_addon() {

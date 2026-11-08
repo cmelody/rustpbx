@@ -1,10 +1,10 @@
 [package]
 name = "rustpbx-record-common"
-version = "0.5.1"
+version = "0.5.2-rc"
 edition = "2024"
 description = "RustPBX component: record-common"
 license = "MIT"
 repository = "https://github.com/restsend/rustpbx"
 
 [dependencies]
-audio-codec = "0.4.7"
+audio-codec = "0.4.13"

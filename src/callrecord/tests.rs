@@ -153,6 +153,158 @@ async fn test_create_call_record_table() {
     assert!(rows.is_ok(), "table should exist");
 }
 
+/// The table is created on every start: the first call creates the four
+/// indexes, later calls find them and skip, and a missing one is recreated.
+async fn assert_call_record_indexes_created_once(db: &DatabaseConnection, table: &str) {
+    use sea_orm::ConnectionTrait;
+    let names = ["call_id", "session_id", "started_at", "status"].map(|c| format!("idx_{table}_{c}"));
+    let manager = sea_orm_migration::SchemaManager::new(db);
+    create_call_record_table(db, table).await.unwrap();
+    for name in &names {
+        assert!(manager.has_index(table, name).await.unwrap(), "{name}");
+    }
+    create_call_record_table(db, table).await.unwrap();
+
+    let drop = sea_orm::sea_query::Index::drop()
+        .name(names[3].as_str())
+        .table(sea_orm::sea_query::Alias::new(table))
+        .to_owned();
+    db.execute_raw(db.get_database_backend().build(&drop)).await.unwrap();
+    assert!(!manager.has_index(table, &names[3]).await.unwrap());
+    create_call_record_table(db, table).await.unwrap();
+    for name in &names {
+        assert!(manager.has_index(table, name).await.unwrap(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn test_call_record_indexes_created_once_sqlite() {
+    assert_call_record_indexes_created_once(&in_memory_db().await, "test_cdrs").await;
+}
+
+#[tokio::test]
+#[ignore = "requires RUSTPBX_POSTGRES_TEST_URL pointing to a PostgreSQL test database"]
+async fn test_call_record_indexes_created_once_postgres() {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+    let mut options = ConnectOptions::new(std::env::var("RUSTPBX_POSTGRES_TEST_URL").unwrap());
+    options.max_connections(1);
+    let db = Database::connect(options).await.unwrap();
+    db.execute_unprepared(
+        "DROP SCHEMA IF EXISTS cdr_index_test CASCADE; CREATE SCHEMA cdr_index_test; \
+         SET search_path TO cdr_index_test",
+    )
+    .await
+    .unwrap();
+    assert_call_record_indexes_created_once(&db, "test_cdrs").await;
+    db.execute_unprepared("DROP SCHEMA cdr_index_test CASCADE").await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires RUSTPBX_MYSQL_TEST_URL pointing to a MySQL test server"]
+async fn test_call_record_indexes_created_once_mysql() {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+    let mut options = ConnectOptions::new(std::env::var("RUSTPBX_MYSQL_TEST_URL").unwrap());
+    options.max_connections(1);
+    let db = Database::connect(options).await.unwrap();
+    for sql in [
+        "DROP DATABASE IF EXISTS rustpbx_cdr_index_test",
+        "CREATE DATABASE rustpbx_cdr_index_test",
+        "USE rustpbx_cdr_index_test",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assert_call_record_indexes_created_once(&db, "test_cdrs").await;
+    db.execute_unprepared("DROP DATABASE rustpbx_cdr_index_test").await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires RUSTPBX_POSTGRES_TEST_URL pointing to a PostgreSQL test database"]
+async fn test_custom_cdr_postgres_timestamptz_upgrade() {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+    let mut options = ConnectOptions::new(std::env::var("RUSTPBX_POSTGRES_TEST_URL").unwrap());
+    options.max_connections(1);
+    let db = Database::connect(options).await.unwrap();
+    db.execute_unprepared("CREATE SCHEMA custom_cdr_tz_test").await.unwrap();
+    db.execute_unprepared("SET search_path TO custom_cdr_tz_test").await.unwrap();
+    db.execute_unprepared("CREATE TABLE test_cdrs (id BIGSERIAL PRIMARY KEY, call_id TEXT, \
+         started_at TIMESTAMP NOT NULL, ended_at TIMESTAMP, created_at TIMESTAMPTZ NOT NULL)")
+        .await
+        .unwrap();
+    // Creating over an old table fixes the naive columns and keeps the rest.
+    create_call_record_table(&db, "test_cdrs").await.unwrap();
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT data_type::text AS t FROM information_schema.columns \
+             WHERE table_schema = 'custom_cdr_tz_test' AND table_name = 'test_cdrs' \
+             AND column_name IN ('started_at', 'ended_at', 'created_at')",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(row.try_get::<String>("", "t").unwrap(), "timestamp with time zone");
+    }
+    db.execute_unprepared("DROP SCHEMA custom_cdr_tz_test CASCADE").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_custom_saver_sqlite_keeps_text_format() {
+    use sea_orm::{ConnectionTrait, Statement};
+    let db = in_memory_db().await;
+    create_call_record_table(&db, "my_cdrs").await.unwrap();
+    let saver = crate::callrecord::CustomDatabaseSaver {
+        db: db.clone(),
+        table_name: "my_cdrs".to_string(),
+    };
+    let record = make_record();
+    saver.save(std::slice::from_ref(&record)).await.unwrap();
+    // Typed binds must store the same RFC 3339 text the old string binds did.
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT CAST(started_at AS TEXT) AS s, CAST(ended_at AS TEXT) AS e FROM my_cdrs",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "s").unwrap(), record.start_time.to_rfc3339());
+    assert_eq!(row.try_get::<String>("", "e").unwrap(), record.end_time.to_rfc3339());
+}
+
+#[tokio::test]
+#[ignore = "requires RUSTPBX_POSTGRES_TEST_URL pointing to a PostgreSQL test database"]
+async fn test_custom_saver_writes_on_postgres() {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+    let mut options = ConnectOptions::new(std::env::var("RUSTPBX_POSTGRES_TEST_URL").unwrap());
+    options.max_connections(1);
+    let db = Database::connect(options).await.unwrap();
+    db.execute_unprepared("CREATE SCHEMA custom_saver_pg_test").await.unwrap();
+    db.execute_unprepared("SET search_path TO custom_saver_pg_test").await.unwrap();
+    create_call_record_table(&db, "my_cdrs").await.unwrap();
+    let saver = crate::callrecord::CustomDatabaseSaver {
+        db: db.clone(),
+        table_name: "my_cdrs".to_string(),
+    };
+    let mut record = make_record();
+    record.start_time = "2026-10-19T05:55:49.123456Z".parse().unwrap();
+    record.end_time = record.start_time + chrono::Duration::seconds(30);
+    record.details.metadata = Some(HashMap::from([("k".to_string(), "v".into())]));
+    saver.save(std::slice::from_ref(&record)).await.unwrap();
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT started_at, ended_at, metadata::text AS metadata FROM my_cdrs",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<chrono::DateTime<Utc>>("", "started_at").unwrap(), record.start_time);
+    assert_eq!(row.try_get::<chrono::DateTime<Utc>>("", "ended_at").unwrap(), record.end_time);
+    assert!(row.try_get::<String>("", "metadata").unwrap().contains("\"k\""));
+    db.execute_unprepared("DROP SCHEMA custom_saver_pg_test CASCADE").await.unwrap();
+}
+
 // ── BuiltinDatabaseSaver ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1670,11 +1822,17 @@ async fn test_persist_call_records_writes_session_id_column() {
     use rustpbx_models::call_record::Column;
     use sea_orm::{ColumnTrait, QueryFilter};
 
-    let db = rustpbx_models::create_db("sqlite::memory:", None)
+    let url = std::env::var("RUSTPBX_CDR_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite::memory:".to_string());
+    let db = rustpbx_models::create_db(&url, None)
         .await
-        .expect("migrated in-memory db");
+        .expect("migrated test db");
 
     let mut record = make_record();
+    record.session_id = Some("initial-root".to_string());
+    crate::callrecord::database::persist_call_records(&db, std::slice::from_ref(&record))
+        .await
+        .expect("initial persist");
     record.session_id = Some("root-of-call".to_string());
     crate::callrecord::database::persist_call_records(&db, std::slice::from_ref(&record))
         .await
@@ -1697,6 +1855,327 @@ async fn test_persist_call_records_writes_session_id_column() {
         .map(|metadata| metadata.get("session_id").is_some())
         .unwrap_or(false);
     assert!(!metadata_has_session, "metadata must not carry session_id");
+}
+
+#[tokio::test]
+async fn test_cluster_sipflow_fragments_survive_cdr_upsert() {
+    use rustpbx_models::call_record::{Column, Entity};
+    use sea_orm::EntityTrait;
+
+    let url = std::env::var("RUSTPBX_CDR_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite::memory:".to_string());
+    let db = rustpbx_models::create_db(&url, None).await.unwrap();
+    for order in ["owner-first", "peer-first", "concurrent"] {
+        let mut owner = make_record();
+        owner.call_id = format!("fragment-merge-{order}");
+        owner.details.recording_url = Some("https://example.com/recording.wav".into());
+        owner.details.metadata = Some(HashMap::from([
+            ("hostname".into(), serde_json::json!("owner")),
+            (
+                "sipflow_fragments".into(),
+                serde_json::json!({"owner": "https://example.com/owner.jsonl"}),
+            ),
+        ]));
+        let mut peer = make_record();
+        peer.call_id = owner.call_id.clone();
+        peer.details.metadata = Some(HashMap::from([(
+            "sipflow_fragments".into(),
+            serde_json::json!({"peer": "https://example.com/peer.jsonl"}),
+        )]));
+        if order == "concurrent" {
+            let (owner_result, peer_result) = tokio::join!(
+                database::persist_call_records(&db, std::slice::from_ref(&owner)),
+                database::persist_call_records(&db, std::slice::from_ref(&peer)),
+            );
+            owner_result.unwrap();
+            peer_result.unwrap();
+        } else {
+            let records = if order == "owner-first" {
+                [&owner, &peer]
+            } else {
+                [&peer, &owner]
+            };
+            for record in records {
+                database::persist_call_records(&db, std::slice::from_ref(record))
+                    .await
+                    .unwrap();
+            }
+        }
+        let row = Entity::find()
+            .filter(Column::CallId.eq(&owner.call_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.recording_url.as_deref(),
+            Some("https://example.com/recording.wav")
+        );
+        let metadata = row.metadata.unwrap();
+        assert_eq!(metadata["hostname"], "owner");
+        assert_eq!(
+            metadata["sipflow_fragments"]["owner"],
+            "https://example.com/owner.jsonl"
+        );
+        assert_eq!(
+            metadata["sipflow_fragments"]["peer"],
+            "https://example.com/peer.jsonl"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_cluster_postcall_metadata_updates_are_atomic() {
+    use rustpbx_models::call_record::{
+        Column, Entity, append_call_trace, update_sipflow_fragment, update_sipflow_jsonl,
+    };
+    use sea_orm::EntityTrait;
+
+    let url = std::env::var("RUSTPBX_CDR_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite::memory:".to_string());
+    let db = rustpbx_models::create_db(&url, None).await.unwrap();
+    let mut record = make_record();
+    record.call_id = "cluster-postcall-metadata".into();
+    record.details.metadata = Some(HashMap::from([(
+        "sipflow_fragments".into(),
+        serde_json::json!({"owner": "https://example.com/owner.jsonl"}),
+    )]));
+    database::persist_call_records(&db, std::slice::from_ref(&record))
+        .await
+        .unwrap();
+    let (trace_a, trace_b, upload) = tokio::join!(
+        append_call_trace(
+            &db,
+            &record.call_id,
+            vec![serde_json::json!({"event": "upload-a"})]
+        ),
+        append_call_trace(
+            &db,
+            &record.call_id,
+            vec![serde_json::json!({"event": "upload-b"})]
+        ),
+        update_sipflow_jsonl(&db, &record.call_id, "https://example.com/latest.jsonl"),
+    );
+    trace_a.unwrap();
+    trace_b.unwrap();
+    upload.unwrap();
+    let row = Entity::find()
+        .filter(Column::CallId.eq(&record.call_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata = row.metadata.unwrap();
+    assert_eq!(
+        metadata["sipflow_fragments"]["owner"],
+        "https://example.com/owner.jsonl"
+    );
+    assert_eq!(
+        metadata["sipflow_jsonl"],
+        "https://example.com/latest.jsonl"
+    );
+    let trace = metadata["trace"].as_array().unwrap();
+    assert!(trace.contains(&serde_json::json!({"event": "upload-a"})));
+    assert!(trace.contains(&serde_json::json!({"event": "upload-b"})));
+
+    let (upload_a, upload_b, late_trace) = tokio::join!(
+        update_sipflow_fragment(
+            &db,
+            &record.call_id,
+            "peer-a",
+            "https://example.com/a.jsonl"
+        ),
+        update_sipflow_fragment(
+            &db,
+            &record.call_id,
+            "peer-b",
+            "https://example.com/b.jsonl"
+        ),
+        append_call_trace(
+            &db,
+            &record.call_id,
+            vec![serde_json::json!({"event": "late-upload"})]
+        ),
+    );
+    upload_a.unwrap();
+    upload_b.unwrap();
+    late_trace.unwrap();
+    let row = Entity::find()
+        .filter(Column::CallId.eq(&record.call_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata = row.metadata.unwrap();
+    assert_eq!(
+        metadata["sipflow_fragments"],
+        serde_json::json!({
+            "owner": "https://example.com/owner.jsonl",
+            "peer-a": "https://example.com/a.jsonl",
+            "peer-b": "https://example.com/b.jsonl",
+        })
+    );
+    assert!(
+        ["https://example.com/a.jsonl", "https://example.com/b.jsonl"]
+            .contains(&metadata["sipflow_jsonl"].as_str().unwrap())
+    );
+    let trace = metadata["trace"].as_array().unwrap();
+    assert!(trace.contains(&serde_json::json!({"event": "upload-a"})));
+    assert!(trace.contains(&serde_json::json!({"event": "upload-b"})));
+    assert!(trace.contains(&serde_json::json!({"event": "late-upload"})));
+
+    update_sipflow_fragment(
+        &db,
+        "missing-fragment-row",
+        "missing",
+        "https://example.com/missing.jsonl",
+    )
+    .await
+    .unwrap();
+    assert!(
+        Entity::find()
+            .filter(Column::CallId.eq("missing-fragment-row"))
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_persist_call_records_preserves_recorded_snapshot() {
+    use rustpbx_models::call_record::{Column, Entity};
+    use sea_orm::EntityTrait;
+
+    // An explicitly supplied database must be a disposable, independently migrated test DB.
+    let url = std::env::var("RUSTPBX_CDR_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite::memory:".to_string());
+    let db = rustpbx_models::create_db(&url, None).await.unwrap();
+    let uploaded_url = "https://recordings.example.com/agent.wav";
+    for (case, steps) in [
+        (
+            "upload_then_delivery",
+            vec!["owner", "upload", "delivery", "delivery"],
+        ),
+        (
+            "delivery_then_owner",
+            vec!["delivery", "owner", "upload", "delivery"],
+        ),
+        (
+            "delivery_before_upload",
+            vec!["owner", "delivery", "upload", "delivery"],
+        ),
+        (
+            "batch_owner_first",
+            vec!["batch_owner_first", "upload", "delivery"],
+        ),
+        (
+            "batch_delivery_first",
+            vec!["batch_delivery_first", "upload", "delivery"],
+        ),
+    ] {
+        let mut owner = make_record();
+        owner.call_id = format!("recorded-snapshot-{case}");
+        owner.session_id = Some(owner.call_id.clone());
+        owner.start_time = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        owner.ring_time = Some(owner.start_time + chrono::Duration::seconds(10));
+        owner.answer_time = Some(owner.start_time + chrono::Duration::seconds(17));
+        owner.end_time = owner.start_time + chrono::Duration::seconds(30);
+        owner.callee = "queue".into();
+        owner.details.recording_url = Some("recordings/agent.wav".into());
+        owner.details.recording_duration_secs = Some(13);
+        owner.details.metadata = Some(HashMap::from([
+            ("hostname".into(), serde_json::json!("origin.example.com")),
+            (
+                "recording_segments".into(),
+                serde_json::json!([{
+                    "unique_id": "agent-segment", "path": "recordings/agent.wav"
+                }]),
+            ),
+        ]));
+        let mut delivery = make_record();
+        delivery.call_id = owner.call_id.clone();
+        delivery.session_id = owner.session_id.clone();
+        delivery.start_time = owner.start_time + chrono::Duration::seconds(10);
+        delivery.end_time = owner.end_time + chrono::Duration::milliseconds(100);
+        delivery.callee = "agent".into();
+        delivery.details.metadata = Some(HashMap::from([(
+            "hostname".into(),
+            serde_json::json!("delivery.example.com"),
+        )]));
+        let mut records = [owner, delivery];
+        for step in steps {
+            match step {
+                "owner" | "delivery" => {
+                    let record = &records[usize::from(step == "delivery")];
+                    database::persist_call_records(&db, std::slice::from_ref(record))
+                        .await
+                        .unwrap();
+                }
+                "upload" => {
+                    rustpbx_models::call_record::update_recording_url(
+                        &db,
+                        &records[0].call_id,
+                        uploaded_url,
+                        13,
+                    )
+                    .await
+                    .unwrap();
+                }
+                "batch_owner_first" => {
+                    database::persist_call_records(&db, &records).await.unwrap();
+                }
+                "batch_delivery_first" => {
+                    records.swap(0, 1);
+                    database::persist_call_records(&db, &records).await.unwrap();
+                    records.swap(0, 1);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let row = Entity::find()
+            .filter(Column::CallId.eq(&records[0].call_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.recording_url.as_deref(), Some(uploaded_url), "{case}");
+        assert_eq!(row.recording_duration_secs, Some(13), "{case}");
+        assert_eq!(row.callee_uri.as_deref(), Some("queue"), "{case}");
+        assert_eq!(row.started_at, records[0].start_time, "{case}");
+        assert_eq!(row.ended_at, Some(records[0].end_time), "{case}");
+        let metadata = row.metadata.unwrap();
+        assert_eq!(metadata["hostname"], "origin.example.com", "{case}");
+        assert!(metadata.get("sipflow_fragments").is_none(), "{case}");
+        assert_eq!(
+            metadata["recording_segments"][0]["unique_id"], "agent-segment",
+            "{case}"
+        );
+        if case == "delivery_then_owner" {
+            Entity::update_many()
+                .col_expr(
+                    Column::Metadata,
+                    sea_orm::sea_query::Expr::val(None::<serde_json::Value>),
+                )
+                .filter(Column::CallId.eq(&records[0].call_id))
+                .exec(&db)
+                .await
+                .unwrap();
+            database::persist_call_records(&db, std::slice::from_ref(&records[1]))
+                .await
+                .unwrap();
+            let row = Entity::find()
+                .filter(Column::CallId.eq(&records[0].call_id))
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                row.metadata.is_none(),
+                "an owner without metadata must keep SQL NULL"
+            );
+        }
+    }
 }
 
 /// Cluster-shaped logical call: one root session (IVR → queue → agent) plus

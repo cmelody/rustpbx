@@ -188,7 +188,12 @@ async fn test_attended_refer_existing_cross_session_dialogs() {
     let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 23456 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n".to_string();
     let mut original = Vec::new();
     for (caller, callee, name) in [(alice.clone(), bob.clone(), "bob"), (bob.clone(), charlie.clone(), "charlie")] {
-        let dial = rustpbx::utils::spawn({ let caller = caller.clone(); let sdp = sdp.clone(); async move { caller.make_call(name, Some(sdp)).await.unwrap() } });
+        // Alice offers Opus first, but Bob answers with PCMU on the original call.
+        let offer = if name == "bob" {
+            sdp.replace("RTP/AVP 0", "RTP/AVP 96 0 97")
+                .replace("a=rtpmap:0", "a=rtpmap:96 opus/48000/2\r\na=rtpmap:97 telephone-event/8000\r\na=rtpmap:0")
+        } else { sdp.clone() };
+        let dial = rustpbx::utils::spawn({ let caller = caller.clone(); let sdp = offer; async move { caller.make_call(name, Some(sdp)).await.unwrap() } });
         let received = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 for event in callee.process_dialog_events().await.unwrap() {
@@ -212,6 +217,13 @@ async fn test_attended_refer_existing_cross_session_dialogs() {
     let c_owner = registry.get_handle_by_dialog(&original[1].0.call_id).unwrap();
     assert_ne!(a_owner.session_id(), c_owner.session_id());
     let consult = &original[1].0;
+    let initial_answer = alice.get_negotiated_answer_sdp(&original[0].0).await.unwrap();
+    let initial_audio = initial_answer.lines().find(|line| line.starts_with("m=audio ")).unwrap();
+    assert!(initial_audio.contains("RTP/AVP 0"));
+    let resumed_rtp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let resume_answer = sdp.replace("23456", &resumed_rtp.local_addr().unwrap().port().to_string());
+    alice.set_answer_sdp(&original[0].0, &resume_answer).await;
+    let mut saw_resume = false;
     for (tag, expected) in [("wrong-tag".to_string(), 481), (consult.remote_tag.clone(), 200)] {
         let replaces = format!("{};to-tag={};from-tag={}", consult.call_id, tag, consult.local_tag);
         let target = format!("sip:charlie@{}?Replaces={}", server.proxy_addr, urlencoding::encode(&replaces));
@@ -220,6 +232,15 @@ async fn test_attended_refer_existing_cross_session_dialogs() {
             loop {
                 for (ua, existing) in [(&alice, &original[0].0), (&charlie, &original[1].1)] {
                     let events = ua.process_dialog_events().await.unwrap();
+                    for event in &events {
+                        if let TestUaEvent::CallUpdated(id, rsipstack::sip::Method::Invite, Some(offer)) = event
+                            && id == &original[0].0 && offer.contains("a=sendrecv")
+                        {
+                            assert_eq!(offer.lines().find(|line| line.starts_with("m=audio ")), Some(initial_audio),
+                                "resume must preserve Alice's negotiated audio port and payloads");
+                            saw_resume = true;
+                        }
+                    }
                     assert!(!events.iter().any(|event| matches!(event, TestUaEvent::IncomingCall(id, _) if id.call_id != existing.call_id)),
                         "attended REFER must not originate another call: {events:?}");
                     assert!(!events.iter().any(|event| matches!(event, TestUaEvent::CallTerminated(..))),
@@ -245,8 +266,26 @@ async fn test_attended_refer_existing_cross_session_dialogs() {
             "only successful attended REFER emits one transfer event");
         if let Some(event) = transfers.first() {
             assert_eq!(event.payload["call_id"], a_owner.session_id());
+            // Attended REFER completion: the stashed origin (the
+            // transferring party) rides the terminal event.
+            assert_eq!(
+                event.payload["transfer_source"]["source_type"], "agent",
+                "transfer origin: {}",
+                event.payload
+            );
+            assert_eq!(
+                event.payload["transfer_source"]["agent_id"], "bob",
+                "transfer origin agent: {}",
+                event.payload
+            );
         }
     }
+    assert!(saw_resume, "expected a resume re-INVITE on the held caller dialog");
+    let mut packet = [0; 2048];
+    let len = tokio::time::timeout(Duration::from_secs(4), resumed_rtp.recv(&mut packet))
+        .await.expect("RTP must reach the port Alice advertised on resume").unwrap();
+    assert!(len >= 12 && packet[0] >> 6 == 2);
+    assert_eq!(packet[1] & 0x7f, 0, "Alice must receive PCMU after resume");
     let room = server.server_ref.conference_server.list_conferences_detail().await.into_iter()
         .find(|room| room.host_leg_id == Some(rustpbx::call::domain::LegId::from(format!("{}-caller", a_owner.session_id()))))
         .expect("surviving caller owns the transfer room");
@@ -277,6 +316,86 @@ async fn test_attended_refer_existing_cross_session_dialogs() {
     }).await.expect("either participant leaving must end the transferred call");
     server.stop();
     }
+}
+
+/// Attended REFER from the CALLER leg (agent-placed outbound call): alice
+/// (agent) dials charlie (customer) — alice is the session's caller leg —
+/// consults bob, then sends the attended REFER on her caller-leg dialog.
+/// RFC 5589 allows either party to transfer; the guard must not reject the
+/// REFER for not originating from the callee leg.
+#[tokio::test]
+async fn test_attended_refer_from_caller_leg_agent_outbound() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let port = portpicker::pick_unused_port().unwrap();
+    let mut config = crate::common::test_helpers::test_proxy_config(port);
+    config.media_proxy = MediaProxyMode::All;
+    let mut users = crate::common::test_helpers::standard_test_users();
+    for user in &mut users { user.is_support_webrtc = false; }
+    let server = Arc::new(E2eTestServer::start_with_inject(config, E2eTestServerInject {
+        users, ..Default::default()
+    }).await.unwrap());
+    let alice = server.create_ua("alice").await.unwrap();
+    let bob = server.create_ua("bob").await.unwrap();
+    let charlie = server.create_ua("charlie").await.unwrap();
+    let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 23456 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n".to_string();
+    let mut original = Vec::new();
+    // call1: alice (agent, caller) -> charlie (customer); call2: alice -> bob (consult)
+    for (caller, callee, name) in [(alice.clone(), charlie.clone(), "charlie"), (alice.clone(), bob.clone(), "bob")] {
+        let dial = rustpbx::utils::spawn({ let caller = caller.clone(); let sdp = sdp.clone(); async move { caller.make_call(name, Some(sdp)).await.unwrap() } });
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                for event in callee.process_dialog_events().await.unwrap() {
+                    if let TestUaEvent::IncomingCall(id, _) = event {
+                        callee.answer_call(&id, Some(sdp.clone())).await.unwrap();
+                        return id;
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        let sent = dial.await.unwrap();
+        caller.set_answer_sdp(&sent, &sdp).await;
+        callee.set_answer_sdp(&received, &sdp).await;
+        original.push((sent, received));
+    }
+    let registry = &server.server_ref.active_call_registry;
+    let s1 = registry.get_handle_by_dialog(&original[0].0.call_id).unwrap();
+    let s2 = registry.get_handle_by_dialog(&original[1].0.call_id).unwrap();
+    assert_ne!(s1.session_id(), s2.session_id(), "consult must be a separate session");
+    let consult = &original[1].0;
+    let replaces = format!("{};to-tag={};from-tag={}", consult.call_id, consult.remote_tag, consult.local_tag);
+    let target = format!("sip:bob@{}?Replaces={}", server.proxy_addr, urlencoding::encode(&replaces));
+    assert_eq!(alice.send_refer(&original[0].0, &target).await.unwrap(), 202);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            for event in alice.process_dialog_events().await.unwrap() {
+                if let TestUaEvent::ReferNotify(_, body, state) = event {
+                    if state.starts_with("terminated") {
+                        assert!(body.contains("SIP/2.0 200"), "attended REFER from the caller leg must succeed: {body}");                        return;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("final NOTIFY must arrive");
+    // The transferor releases its superseded dialogs (client-side duty, same
+    // as the existing test); a transfer room bridges the surviving parties.
+    alice.hangup(&original[0].0).await.unwrap();
+    alice.hangup(&original[1].0).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry.count() == 2 { break; }
+            alice.process_dialog_events().await.unwrap();
+            charlie.process_dialog_events().await.unwrap();
+            bob.process_dialog_events().await.unwrap();
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("transferor legs must be released after hand-off");
+    let room = server.server_ref.conference_server.list_conferences_detail().await.into_iter()
+        .find(|room| room.participant_count() == 2)
+        .expect("transfer room bridges the surviving parties");
+    assert!(room.focus_uri.is_none());
+    server.stop();
 }
 
 #[tokio::test]

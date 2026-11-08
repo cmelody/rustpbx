@@ -55,6 +55,15 @@ impl CallReporter {
                 + Duration::from_std(at.duration_since(self.context.start_time)).unwrap_or_default()
         });
         let call_was_accepted = snapshot.answer_time.is_some();
+        // The call ended when the hangup started, not when teardown finished.
+        let end_time = snapshot
+            .hangup_time
+            .map(|ht| {
+                start_time
+                    + Duration::from_std(ht.duration_since(self.context.start_time))
+                        .unwrap_or_default()
+            })
+            .map_or(now, |end| answer_time.map_or(end, |answer| end.max(answer)));
 
         // The CDR status must reflect the INVITE transaction's final status and
         // never be changed by later signaling (BYE, re-INVITE failures, transfer
@@ -207,7 +216,7 @@ impl CallReporter {
             .root_session_id
             .clone()
             .unwrap_or_else(|| self.context.session_id.clone());
-        let (recorder, mut metadata_map) = collect_recording_artifacts(
+        let (mut recorder, mut metadata_map) = collect_recording_artifacts(
             &snapshot,
             &root_session,
             self.context.dialplan.recording.enabled,
@@ -218,6 +227,9 @@ impl CallReporter {
                 .as_ref()
                 .map(|o| o.recorder_file.as_str()),
         );
+        if !call_was_accepted && self.context.dialplan.recording.discard_unanswered {
+            discard_recordings(&self.context.session_id, &mut recorder, &mut metadata_map);
+        }
         // Copy values from cookie to extras_map
         // (Removed as TransactionCookie no longer has values)
 
@@ -287,6 +299,7 @@ impl CallReporter {
             recording_url: recording_path_for_db,
             rewrite,
             last_error,
+            amd: snapshot.amd.clone(),
             metadata: if metadata_map.is_empty() {
                 None
             } else {
@@ -350,7 +363,7 @@ impl CallReporter {
             start_time,
             ring_time,
             answer_time,
-            end_time: now,
+            end_time,
             caller: caller.clone(),
             callee: callee.clone(),
             status_code,
@@ -469,6 +482,12 @@ fn collect_recording_artifacts(
                     serde_json::Value::String(ended.clone()),
                 );
             }
+            if let Some(ref media_kind) = seg.media_kind {
+                extra.insert(
+                    "media_kind".to_string(),
+                    serde_json::Value::String(media_kind.clone()),
+                );
+            }
             recorder.push(CallRecordMedia {
                 track_id: format!("segment:{}:{}", seg.segment_type, seg.segment_id),
                 path: seg.path.clone(),
@@ -504,6 +523,27 @@ fn collect_recording_artifacts(
     }
 
     (recorder, metadata_map)
+}
+
+/// `[recording] discard_unanswered`: delete an unanswered call's recording
+/// files and leave them out of the record, so nothing is uploaded or linked.
+fn discard_recordings(
+    session_id: &str,
+    recorder: &mut Vec<CallRecordMedia>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    for media in recorder.drain(..) {
+        match fs::remove_file(&media.path) {
+            Ok(()) => {
+                tracing::info!(session_id, path = %media.path, "discarded recording of unanswered call")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(session_id, path = %media.path, error = %e, "failed to discard recording of unanswered call")
+            }
+        }
+    }
+    metadata.remove("recording_segments");
 }
 
 fn enrich_error_metadata(
@@ -586,6 +626,11 @@ fn build_sip_leg_roles(snapshot: &CallSessionRecordSnapshot) -> HashMap<String, 
     let mut sip_leg_roles = HashMap::new();
     let caller_call_id = snapshot.server_dialog_id.call_id.clone();
     sip_leg_roles.insert(caller_call_id.clone(), "caller".to_string());
+    // Agent-facing legs (`LegPurpose::Agent` / `Consult`) dial with the
+    // primary session id as their Call-ID. When the inbound Call-ID is
+    // UUID-shaped it normalizes to that SAME id, so the agent leg's Call-ID
+    // collides with the caller entry above — the guard keeps "caller"
+    // authoritative for it (one entry, never clobbered by the B side).
     for call_id in &snapshot.callee_call_ids {
         if call_id != &caller_call_id {
             sip_leg_roles.insert(call_id.clone(), "callee".to_string());
@@ -598,24 +643,9 @@ fn resolve_user_info(
     cookie: &TransactionCookie,
     caller_uri: &str,
 ) -> (Option<String>, Option<String>, Option<i64>, Option<i64>) {
-    let mut from_number = extract_sip_username(caller_uri);
+    let from_number = extract_sip_username(caller_uri);
     let (from_display_name, department_id, extension_id) = if let Some(user) = cookie.get_user() {
-        let mut dept_id = None;
-        let mut is_wholesale = false;
-
-        if let Some(deps) = &user.departments {
-            for d in deps {
-                if d.starts_with("tenant:") {
-                    is_wholesale = true;
-                } else if let Ok(id) = d.parse::<i64>() {
-                    dept_id = Some(id);
-                }
-            }
-        }
-
-        if is_wholesale {
-            from_number = Some(user.username.clone());
-        }
+        let dept_id = user.department_ids.first().copied();
 
         let ext_id = if user.id > 0 {
             Some(user.id as i64)
@@ -636,12 +666,11 @@ mod tests {
     use crate::call::SipUser;
 
     #[test]
-    fn test_resolve_user_info_wholesale() {
+    fn test_resolve_user_info_without_departments() {
         let cookie = TransactionCookie::default();
         let user = SipUser {
             username: "1234".to_string(),
             display_name: Some("alice".to_string()),
-            departments: Some(vec!["tenant:100".to_string()]),
             ..Default::default()
         };
         cookie.set_user(user);
@@ -649,19 +678,19 @@ mod tests {
         let caller = "sip:mock-uuid@1.2.3.4";
         let (from, from_name, dept, ext) = resolve_user_info(&cookie, caller);
 
-        assert_eq!(from, Some("1234".to_string()));
+        assert_eq!(from, Some("mock-uuid".to_string()));
         assert_eq!(from_name, Some("alice".to_string()));
         assert_eq!(dept, None);
         assert_eq!(ext, None);
     }
 
     #[test]
-    fn test_resolve_user_info_mixed() {
+    fn test_resolve_user_info_first_department_id() {
         let cookie = TransactionCookie::default();
         let user = SipUser {
             username: "1234".to_string(),
             display_name: Some("alice".to_string()),
-            departments: Some(vec!["tenant:100".to_string(), "5".to_string()]),
+            department_ids: vec![9, 5, 12],
             id: 99,
             ..Default::default()
         };
@@ -670,9 +699,9 @@ mod tests {
         let caller = "sip:mock-uuid@1.2.3.4";
         let (from, from_name, dept, ext) = resolve_user_info(&cookie, caller);
 
-        assert_eq!(from, Some("1234".to_string()));
+        assert_eq!(from, Some("mock-uuid".to_string()));
         assert_eq!(from_name, Some("alice".to_string()));
-        assert_eq!(dept, Some(5));
+        assert_eq!(dept, Some(9));
         assert_eq!(ext, Some(99));
     }
 
@@ -682,7 +711,7 @@ mod tests {
         let user = SipUser {
             username: "1001".to_string(),
             display_name: Some("alice".to_string()),
-            departments: Some(vec!["5".to_string()]),
+            department_ids: vec![5],
             id: 99,
             ..Default::default()
         };
@@ -761,49 +790,104 @@ mod tests {
         assert!(from.is_some() || from.is_none()); // Behavior depends on implementation
     }
 
-    #[test]
-    fn test_build_sip_leg_roles_uses_callee_call_ids() {
-        let snapshot = CallSessionRecordSnapshot {
-            ring_time: None,
-            answer_time: None,
-            last_error: None,
-            root_session_id: None,
-            invite_final_status: None,
-            hangup_reason: None,
-            hangup_messages: vec![],
-            original_caller: None,
-            original_callee: None,
-            routed_caller: None,
-            routed_callee: None,
-            connected_callee: None,
-            routed_contact: None,
-            routed_destination: None,
-            callee_peer: None,
-            last_queue_name: None,
-            transferred: false,
-            leg_timeline: crate::callrecord::LegTimeline::default(),
-            callee_call_ids: vec!["callee-call-id".to_string()],
-            server_dialog_id: rsipstack::dialog::DialogId {
-                call_id: "caller-call-id".to_string(),
-                local_tag: "local".to_string(),
-                remote_tag: "remote".to_string(),
-            },
-            extensions: http::Extensions::new(),
-            metadata: std::collections::HashMap::new(),
-            media_quality: None,
-            recording_segments: Vec::new(),
+    #[tokio::test]
+    async fn test_call_record_preserves_dynamic_sip_leg_call_ids() {
+        use crate::call::domain::CallCommand;
+        use crate::call::{DialDirection, Dialplan};
+        use crate::media::leg_id::LegId;
+        use crate::proxy::tests::common::{create_test_request, create_test_server};
+        use crate::proxy::tests::test_sip_session_regressions::build_session_with_cmd_rx_on;
+        use rsipstack::sip::{Method, SipMessage, StatusCode};
+        use rsipstack::transport::SipAddr;
+        use rsipstack::transport::udp::UdpConnection;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (server, _) = create_test_server().await;
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        server.endpoint.inner.transport_layer.del_transport(&SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: "127.0.0.1:5060".try_into().unwrap(),
+        });
+        let transport =
+            UdpConnection::create_connection("127.0.0.1:0".parse().unwrap(), None, None)
+                .await
+                .unwrap();
+        server.endpoint.inner.transport_layer.add_transport(transport.into());
+        let endpoint = server.endpoint.inner.clone();
+        let serving = tokio::spawn(async move { endpoint.serve().await.unwrap(); });
+        let request = create_test_request(Method::Invite, "alice", None, "rustpbx.com", None);
+        let dialplan = Dialplan::new("dynamic-record".into(), request, DialDirection::Outbound);
+        let (mut session, _handle, mut commands) =
+            build_session_with_cmd_rx_on(server.clone(), dialplan).await;
+        let leg_id = LegId::from("agent");
+        let added = session
+            .execute_command(
+                CallCommand::LegAdd {
+                    source_leg: None,
+                    target: format!("sip:agent@{target_addr}"),
+                    leg_id: Some(leg_id.clone()),
+                    headers: vec![],
+                    purpose: None,
+},
+                None,
+            )
+            .await;
+        assert!(added.success, "{:?}", added.message);
+        let mut buffer = [0u8; 65536];
+        let (size, peer) = timeout(Duration::from_secs(3), target.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let SipMessage::Request(invite) =
+            SipMessage::try_from(std::str::from_utf8(&buffer[..size]).unwrap()).unwrap()
+        else {
+            panic!("expected dynamic leg INVITE");
         };
+        assert_eq!(invite.method, Method::Invite);
+        let call_id = invite.call_id_header().unwrap().value().to_string();
+        let caller_id = session.record_snapshot().server_dialog_id.call_id;
+        let (sender, mut records) = tokio::sync::mpsc::channel(2);
+        let reporter = CallReporter {
+            server: server.clone(),
+            context: session.context.clone(),
+            call_record_sender: Some(sender),
+        };
+        reporter.report(session.record_snapshot());
+        let pending = records.recv().await.unwrap();
 
-        let roles = build_sip_leg_roles(&snapshot);
+        let rejected = server.endpoint.inner.make_response(&invite, StatusCode::BusyHere, None);
+        target.send_to(rejected.to_string().as_bytes(), peer).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let command = commands.recv().await.expect("dynamic leg result");
+                let failed = matches!(&command, CallCommand::LegFailed { leg_id: id, .. } if id == &leg_id);
+                session.execute_command(command, None).await;
+                if failed {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("rejected leg must finish");
+        assert!(!session.legs.contains_key(&leg_id));
+        reporter.report(session.record_snapshot());
+        let finished = records.recv().await.unwrap();
+        session.cancel_token.cancel();
+        serving.abort();
 
-        assert_eq!(
-            roles.get("caller-call-id").map(String::as_str),
-            Some("caller")
-        );
-        assert_eq!(
-            roles.get("callee-call-id").map(String::as_str),
-            Some("callee")
-        );
+        for record in [pending, finished] {
+            assert_eq!(
+                record.sip_leg_roles.get(&caller_id).map(String::as_str),
+                Some("caller")
+            );
+            assert_eq!(
+                record.sip_leg_roles.get(&call_id).map(String::as_str),
+                Some("callee")
+            );
+            assert_eq!(record.sip_leg_roles.len(), 2);
+        }
     }
 
     fn meta_str<'a>(meta: &'a HashMap<String, serde_json::Value>, key: &str) -> &'a str {
@@ -838,24 +922,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "addon-wholesale")]
-    fn enrich_metadata_severity_and_catalog_message_fallback() {
-        // A registered code with no dynamic detail: severity + catalog default
-        // message are resolved from the registry at write time.
-        let mut meta: HashMap<String, serde_json::Value> = HashMap::new();
-        let route = HashMap::from([(
-            "error_code".to_string(),
-            "wholesale.insufficient_funds".to_string(),
-        )]);
-        enrich_error_metadata(&mut meta, Some(&route), 402, None, None);
-        assert_eq!(
-            meta_str(&meta, "error_severity"),
-            crate::call_errors::ErrSeverity::Warn.as_str()
-        );
-        assert_eq!(meta_str(&meta, "error_message"), "Insufficient funds");
-    }
-
-    #[test]
     fn enrich_metadata_unknown_code_no_severity() {
         // An unregistered code (e.g. from a newer build) must not panic; it
         // simply leaves error_severity absent for the renderer to default.
@@ -883,6 +949,7 @@ mod tests {
         CallSessionRecordSnapshot {
             ring_time: None,
             answer_time: None,
+            hangup_time: None,
             last_error: None,
             root_session_id: Some("root-sess".into()),
             invite_final_status: None,
@@ -907,6 +974,7 @@ mod tests {
             },
             extensions: http::Extensions::new(),
             metadata: HashMap::new(),
+            amd: None,
             media_quality: None,
             recording_segments: Vec::new(),
         }
@@ -930,6 +998,7 @@ mod tests {
             started_at: Some("t0".into()),
             ended_at: Some("t1".into()),
             duration_secs: 1.5,
+            media_kind: None,
         }];
 
         let (recorder, meta) = collect_recording_artifacts(&snapshot, "root-sess", false, None);
@@ -965,6 +1034,40 @@ mod tests {
     }
 
     #[test]
+    fn collect_recording_artifacts_carries_media_kind_for_video_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp4 = dir.path().join("full_caller.mp4");
+        std::fs::write(&mp4, b"mp4bytes").unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.recording_segments = vec![crate::callrecord::RecordingSegment {
+            unique_id: Some("vid-1".into()),
+            path: mp4.to_string_lossy().into_owned(),
+            size: 8,
+            segment_type: "full".into(),
+            segment_id: "full:video_caller".into(),
+            seq: 1,
+            label: "full_video_caller".into(),
+            started_at: None,
+            ended_at: None,
+            duration_secs: 2.0,
+            media_kind: Some("video".into()),
+        }];
+        let (recorder, meta) = collect_recording_artifacts(&snapshot, "root", false, None);
+        assert_eq!(recorder.len(), 1);
+        assert_eq!(recorder[0].track_id, "segment:full:full:video_caller");
+        assert_eq!(
+            recorder[0]
+                .extra
+                .as_ref()
+                .and_then(|e| e.get("media_kind"))
+                .and_then(|v| v.as_str()),
+            Some("video"),
+            "video marker must surface in the CDR media extra"
+        );
+        assert!(meta.get("recording_segments").is_some());
+    }
+
+    #[test]
     fn collect_recording_artifacts_falls_back_to_dialplan_file() {
         let dir = tempfile::tempdir().unwrap();
         let wav = dir.path().join("full.wav");
@@ -991,8 +1094,60 @@ mod tests {
             started_at: None,
             ended_at: None,
             duration_secs: 0.0,
+            media_kind: None,
         }];
         let (recorder, _) = collect_recording_artifacts(&snapshot, "root", false, None);
         assert!(recorder.is_empty());
+    }
+
+    /// `[recording] discard_unanswered`: an unanswered call's recording file
+    /// is deleted and left out of the record, so nothing is uploaded or
+    /// linked; an answered call keeps it.
+    #[tokio::test]
+    async fn test_discard_unanswered_recording() {
+        use crate::call::{DialDirection, Dialplan};
+        use crate::media::recorder::RecorderOption;
+        use crate::proxy::tests::common::{create_test_request, create_test_server};
+        use crate::proxy::tests::test_sip_session_regressions::build_session_with_cmd_rx_on;
+        use rsipstack::sip::Method;
+
+        let (server, _) = create_test_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        for answered in [false, true] {
+            let path = dir.path().join(format!("call-{answered}.wav"));
+            std::fs::write(&path, b"RIFF-recording").unwrap();
+            let request = create_test_request(Method::Invite, "alice", None, "rustpbx.com", None);
+            let mut dialplan =
+                Dialplan::new(format!("discard-{answered}"), request, DialDirection::Inbound);
+            dialplan.recording.enabled = true;
+            dialplan.recording.discard_unanswered = true;
+            dialplan.recording.option = Some(RecorderOption {
+                recorder_file: path.display().to_string(),
+                ..Default::default()
+            });
+            let (mut session, _handle, _commands) =
+                build_session_with_cmd_rx_on(server.clone(), dialplan).await;
+            if answered {
+                session.meta.answer_time = Some(std::time::Instant::now());
+            }
+            let (sender, mut records) = tokio::sync::mpsc::channel(1);
+            let reporter = CallReporter {
+                server: server.clone(),
+                context: session.context.clone(),
+                call_record_sender: Some(sender),
+            };
+            reporter.report(session.record_snapshot());
+            let record = records.recv().await.unwrap();
+            session.cancel_token.cancel();
+
+            if answered {
+                assert_eq!(record.recorder.len(), 1, "an answered call keeps its recording");
+                assert!(path.exists());
+            } else {
+                assert!(record.recorder.is_empty(), "nothing left to upload");
+                assert!(record.details.recording_url.is_none());
+                assert!(!path.exists(), "the unanswered recording is deleted");
+            }
+        }
     }
 }

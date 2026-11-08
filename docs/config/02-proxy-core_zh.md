@@ -165,7 +165,9 @@ enable_latching = true
 # when enable_latching = true)
 latching_probation_max_packets = 6
 
-# Enable NAT fix for SIP signaling
+# 信令 NAT 修正：收到的 INVITE/REGISTER（以及 INVITE 的 1xx/2xx 响应）中，
+# 私网 IP 的 Contact 会被改写为实际来源地址。中继自身的 `nat_fix`
+# 会覆盖来自该中继地址的消息的此项设置。
 nat_fix = true
 ```
 
@@ -217,6 +219,7 @@ generated_db = true
 | CC 技能组 | `cc_skill_groups` | `skill_groups.generated.toml` |
 | CC 坐席 | `cc_agents` | `agents.generated.toml` |
 | CC 转接 | `cc_transfer` | `transfer.toml` |
+| CC 小休/行为 | `cc_phone` | `phone.generated.toml` |
 
 > **注意**：模式之间没有迁移路径。从文件系统切换到数据库模式（或反向切换）时，需要通过管理控制台重新导出所有配置。
 

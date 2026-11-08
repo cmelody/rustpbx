@@ -35,7 +35,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-pub(crate) mod database;
+pub mod database;
 pub mod recording_artifacts;
 pub mod recording_upload;
 pub mod sipflow;
@@ -47,9 +47,8 @@ mod tests;
 
 pub use recording_artifacts::{
     ActiveRecording, RecordingSegment, RecordingSource, RecordingSubdir, UploadFailedMarker,
-    is_direct_child_of_root, local_archive_path, predicted_archive_path, segment_wav_path,
-    segmented_wav_path, upload_failed_marker_path, write_upload_failed_marker,
-    write_upload_failed_marker_ex,
+    is_direct_child_of_root, local_archive_path, predicted_archive_path, segmented_wav_path,
+    upload_failed_marker_path, write_upload_failed_marker_ex,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +124,13 @@ pub struct CallDetails {
     pub transcript_language: Option<String>,
     pub tags: Option<Value>,
 
+    /// AMD (answering machine / AI assistant) detection verdict for the
+    /// outbound callee leg, when the resolved `amd` config enabled detection
+    /// and the engine reached a decision. Mirrored into `metadata.amd` so the
+    /// DB JSON column stays queryable without a schema migration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amd: Option<crate::media::amd::AmdVerdict>,
+
     #[serde(default)]
     pub rewrite: CallRecordRewrite,
     pub last_error: Option<CallRecordLastError>,
@@ -192,6 +198,38 @@ pub struct CallRecord {
     pub details: CallDetails,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub extensions: http::Extensions,
+}
+
+impl CallRecord {
+    fn persistence_metadata(&self) -> HashMap<String, Value> {
+        let mut metadata_map = self.details.metadata.clone().unwrap_or_default();
+        // SQL timestamp columns can round to seconds; retain the call's original precision.
+        metadata_map.insert(
+            "start_time".to_string(),
+            serde_json::Value::String(self.start_time.to_rfc3339()),
+        );
+        metadata_map.insert(
+            "end_time".to_string(),
+            serde_json::Value::String(self.end_time.to_rfc3339()),
+        );
+        if !self.sip_leg_roles.is_empty() {
+            let json = serde_json::to_string(&self.sip_leg_roles).unwrap_or_default();
+            metadata_map.insert("sip_leg_roles".to_string(), serde_json::Value::String(json));
+        }
+        if let Some(ring_time) = self.ring_time {
+            metadata_map.insert(
+                "ring_time".to_string(),
+                serde_json::Value::String(ring_time.to_rfc3339()),
+            );
+        }
+        if let Some(answer_time) = self.answer_time {
+            metadata_map.insert(
+                "answer_time".to_string(),
+                serde_json::Value::String(answer_time.to_rfc3339()),
+            );
+        }
+        metadata_map
+    }
 }
 
 /// Extension key stashing the enqueue instant on a `CallRecord` so the
@@ -360,6 +398,7 @@ impl std::str::FromStr for CallRecordHangupReason {
             "canceled" => Ok(Self::Canceled),
             "rejected" => Ok(Self::Rejected),
             "failed" => Ok(Self::Failed),
+            "rtptimeout" => Ok(Self::RtpTimeout),
             "abandoned" => Ok(Self::Abandoned),
             _ => Ok(Self::Other(s.to_string())),
         }
@@ -495,25 +534,6 @@ pub trait CallRecordSaver: Send + Sync {
     async fn save(&self, records: &[CallRecord]) -> Result<Vec<String>>;
 }
 
-pub async fn write_call_record_event<T: Serialize>(
-    r#type: CallRecordEventType,
-    obj: T,
-    file: &mut File,
-) {
-    let content = match serde_json::to_string(&obj) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let event = CallRecordEvent {
-        r#type,
-        timestamp: crate::media::get_timestamp(),
-        content,
-    };
-    if let Ok(line) = serde_json::to_string(&event) {
-        file.write_all(format!("{}\n", line).as_bytes()).await.ok();
-    }
-}
-
 pub fn default_cdr_file_name(record: &CallRecord) -> String {
     format!("{}.json", sanitize_id(&record.call_id))
 }
@@ -541,43 +561,6 @@ pub fn format_file_name(root: &str, record: &CallRecord) -> String {
     }
 }
 
-pub fn format_transcript_path(root: &str, record: &CallRecord) -> String {
-    let trimmed_root = root.trim_end_matches('/');
-    let file_name = default_transcript_file_name(record);
-    if trimmed_root.is_empty() {
-        file_name
-    } else {
-        format!(
-            "{}/{}/{}",
-            trimmed_root,
-            record.start_time.format("%Y%m%d"),
-            file_name
-        )
-    }
-}
-
-pub fn format_media_path(root: &str, record: &CallRecord, media: &CallRecordMedia) -> String {
-    let trimmed_root = root.trim_end_matches('/');
-    let file_name = Path::new(&media.path)
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-        .to_string_lossy()
-        .to_string();
-
-    let key = format!(
-        "{}/{}_{}_{}",
-        record.start_time.format("%Y%m%d"),
-        record.call_id,
-        media.track_id,
-        file_name
-    );
-    if trimmed_root.is_empty() {
-        key
-    } else {
-        format!("{}/{}", trimmed_root, key)
-    }
-}
-
 pub fn sipflow_media_key_for(call_id: &str, start_utc: DateTimeUtc) -> String {
     format!("{}/{}.wav", start_utc.format("%Y%m%d"), call_id)
 }
@@ -596,10 +579,6 @@ pub fn format_sipflow_media_key(record: &CallRecord) -> String {
 
 pub fn format_sipflow_signaling_key(record: &CallRecord) -> String {
     sipflow_signaling_key_for(&record.call_id, record.start_time)
-}
-
-pub fn format_sipflow_media_file_name(record: &CallRecord) -> String {
-    format!("{}.wav", record.call_id)
 }
 
 pub fn format_sipflow_signaling_file_name(record: &CallRecord) -> String {
@@ -1040,24 +1019,7 @@ impl CallRecordRow {
             serde_json::to_value(&record.leg_timeline).ok()
         };
 
-        let mut metadata_map = details.metadata.clone().unwrap_or_default();
-        if !record.sip_leg_roles.is_empty() {
-            let json = serde_json::to_string(&record.sip_leg_roles).unwrap_or_default();
-            metadata_map.insert("sip_leg_roles".to_string(), serde_json::Value::String(json));
-        }
-        if let Some(ring_time) = record.ring_time {
-            metadata_map.insert(
-                "ring_time".to_string(),
-                serde_json::Value::String(ring_time.to_rfc3339()),
-            );
-        }
-        if let Some(answer_time) = record.answer_time {
-            metadata_map.insert(
-                "answer_time".to_string(),
-                serde_json::Value::String(answer_time.to_rfc3339()),
-            );
-        }
-        let metadata = serde_json::to_value(&metadata_map).ok();
+        let metadata = serde_json::to_value(record.persistence_metadata()).ok();
 
         let caller_uri = crate::models::call_record::normalize_endpoint_uri(&record.caller);
         let callee_uri = crate::models::call_record::normalize_endpoint_uri(&record.callee);
@@ -1276,20 +1238,18 @@ fn call_record_columns() -> Vec<Alias> {
     ]
 }
 
+// Bind typed values: Postgres rejects text for timestamptz and json columns,
+// while SQLite stores these exactly as the old RFC 3339 / JSON strings.
 fn build_call_record_values(row: &CallRecordRow) -> Vec<sea_orm::sea_query::SimpleExpr> {
     use sea_orm::sea_query::SimpleExpr;
-    fn opt_str(v: &Option<Value>) -> Option<String> {
-        v.as_ref().map(|v| v.to_string())
-    }
-    let ended_at: Option<String> = row.ended_at.map(|dt| dt.to_rfc3339());
     vec![
         row.call_id.clone().into(),
         row.session_id.clone().into(),
         None::<String>.into(),
         row.direction.clone().into(),
         row.status.clone().into(),
-        row.started_at.to_rfc3339().into(),
-        ended_at.into(),
+        row.started_at.into(),
+        row.ended_at.into(),
         row.duration_secs.into(),
         row.from_number.clone().into(),
         row.to_number.clone().into(),
@@ -1311,12 +1271,12 @@ fn build_call_record_values(row: &CallRecordRow) -> Vec<sea_orm::sea_query::Simp
         SimpleExpr::from(row.has_transcript),
         row.transcript_status.clone().into(),
         row.transcript_language.clone().into(),
-        opt_str(&row.tags).into(),
-        opt_str(&row.leg_timeline).into(),
-        opt_str(&row.metadata).into(),
-        row.created_at.to_rfc3339().into(),
-        row.updated_at.to_rfc3339().into(),
-        None::<String>.into(),
+        row.tags.clone().into(),
+        row.leg_timeline.clone().into(),
+        row.metadata.clone().into(),
+        row.created_at.into(),
+        row.updated_at.into(),
+        None::<DateTimeUtc>.into(),
         row.hangup_reason.clone().into(),
         SimpleExpr::from(row.sip_status_code),
         SimpleExpr::from(row.media_loss_pct),
@@ -1349,8 +1309,8 @@ pub(crate) async fn create_call_record_table(
         .col(string_len_null(Alias::new("display_id"), 255))
         .col(string_len(Alias::new("direction"), 32).not_null())
         .col(string_len(Alias::new("status"), 32).not_null())
-        .col(timestamp(Alias::new("started_at")).not_null())
-        .col(timestamp_null(Alias::new("ended_at")))
+        .col(timestamp_with_time_zone(Alias::new("started_at")).not_null())
+        .col(timestamp_with_time_zone_null(Alias::new("ended_at")))
         .col(integer(Alias::new("duration_secs")).not_null())
         .col(string_len_null(Alias::new("from_number"), 128))
         .col(string_len_null(Alias::new("to_number"), 128))
@@ -1375,9 +1335,9 @@ pub(crate) async fn create_call_record_table(
         .col(json_null(Alias::new("tags")))
         .col(json_null(Alias::new("leg_timeline")))
         .col(json_null(Alias::new("metadata")))
-        .col(timestamp(Alias::new("created_at")).not_null())
-        .col(timestamp(Alias::new("updated_at")).not_null())
-        .col(timestamp_null(Alias::new("archived_at")))
+        .col(timestamp_with_time_zone(Alias::new("created_at")).not_null())
+        .col(timestamp_with_time_zone(Alias::new("updated_at")).not_null())
+        .col(timestamp_with_time_zone_null(Alias::new("archived_at")))
         .col(string_len_null(Alias::new("hangup_reason"), 64))
         .col(integer_null(Alias::new("sip_status_code")))
         .col(double_null(Alias::new("media_loss_pct")))
@@ -1387,6 +1347,11 @@ pub(crate) async fn create_call_record_table(
 
     db.execute_raw(db.get_database_backend().build(&create))
         .await?;
+
+    // Custom CDR databases never run the core migrator, so repair the
+    // Postgres column types here as well.
+    use crate::models::fix_timestamptz_columns as fix;
+    fix::fix_timestamptz_columns(db, table_name, fix::CALL_RECORD_COLUMNS).await?;
 
     // Add unique index on call_id + basic query indexes (must run after CREATE TABLE)
     let indexes = [
@@ -1412,7 +1377,15 @@ pub(crate) async fn create_call_record_table(
             .col(Alias::new("status"))
             .to_owned(),
     ];
+    let manager = sea_orm_migration::SchemaManager::new(db);
     for index in indexes {
+        // This runs on every start and MySQL has no CREATE INDEX IF NOT
+        // EXISTS, so skip indexes the table already has.
+        if let Some(name) = index.get_index_spec().get_name()
+            && manager.has_index(table_name, name).await.unwrap_or(false)
+        {
+            continue;
+        }
         let stmt = db.get_database_backend().build(&index);
         if let Err(e) = db.execute_raw(stmt).await {
             warn!("failed to create index on {}: {}", table_name, e);
@@ -1588,9 +1561,7 @@ impl CallRecordManager {
                             .or_insert_with(|| serde_json::Value::String(self_ip.clone()));
                         metadata
                             .entry("hostname".to_string())
-                            .or_insert_with(|| {
-                                serde_json::Value::String(crate::utils::self_hostname().to_string())
-                            });
+                            .or_insert_with(|| serde_json::Value::String(crate::utils::instance_id()));
                     }
                     for hook in hooks {
                         if let Err(e) = hook.on_record_enrich(&mut records).await {
@@ -1664,6 +1635,46 @@ impl CallRecordManager {
 
 impl From<rustpbx_models::call_record::Model> for CallRecord {
     fn from(val: rustpbx_models::call_record::Model) -> Self {
+        let timestamp = |key: &str| {
+            let raw = val.metadata.as_ref()?.get(key)?.as_str()?;
+            match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(time) => Some(time.with_timezone(&Utc)),
+                Err(err) => {
+                    warn!(call_id = %val.call_id, field = key, error = %err,
+                        "invalid persisted call timestamp");
+                    None
+                }
+            }
+        };
+        let start_time = timestamp("start_time").unwrap_or(val.started_at);
+        let end_time = timestamp("end_time").unwrap_or(val.ended_at.unwrap_or(val.started_at));
+        let ring_time = timestamp("ring_time");
+        let answer_time = timestamp("answer_time");
+        let status_code = val.sip_status_code.and_then(|code| match u16::try_from(code) {
+            Ok(code) => Some(code),
+            Err(err) => {
+                warn!(call_id = %val.call_id, error = %err, "invalid persisted SIP status code");
+                None
+            }
+        }).unwrap_or_default();
+        let hangup_reason = val
+            .hangup_reason
+            .as_deref()
+            .and_then(|reason| match reason.parse() {
+                Ok(reason) => Some(reason),
+                Err(err) => {
+                    warn!(call_id = %val.call_id, error = %err, "invalid persisted hangup reason");
+                    None
+                }
+            });
+        // Restore the AMD verdict from the metadata JSON column (the SQL model
+        // carries no dedicated amd column — zero-migration design; the writer
+        // mirrors `details.amd` into `metadata.amd`).
+        let amd = val
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("amd"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         let details = CallDetails {
             direction: val.direction,
             status: val.status,
@@ -1688,6 +1699,7 @@ impl From<rustpbx_models::call_record::Model> for CallRecord {
             transcript_status: Some(val.transcript_status),
             transcript_language: val.transcript_language,
             tags: val.tags,
+            amd,
             metadata: val.metadata.and_then(|v| serde_json::from_value(v).ok()),
             cdr_file_path: None,
             rewrite: CallRecordRewrite {
@@ -1708,19 +1720,19 @@ impl From<rustpbx_models::call_record::Model> for CallRecord {
 
         CallRecord {
             call_id: val.call_id,
-            session_id: None,
-            start_time: val.started_at,
-            ring_time: None,
-            answer_time: None,
-            end_time: val.ended_at.unwrap_or(val.started_at),
+            session_id: val.session_id,
+            start_time,
+            ring_time,
+            answer_time,
+            end_time,
             caller: val
                 .caller_uri
                 .unwrap_or_else(|| val.from_number.unwrap_or_default()),
             callee: val
                 .callee_uri
                 .unwrap_or_else(|| val.to_number.unwrap_or_default()),
-            status_code: 0,
-            hangup_reason: None,
+            status_code,
+            hangup_reason,
             hangup_messages: Vec::new(),
             recorder: Vec::new(),
             sip_leg_roles: std::collections::HashMap::new(),

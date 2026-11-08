@@ -677,7 +677,9 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
 
     Some(routing::TrunkConfig {
         dest,
+        outbound_proxy: backup_dest.clone(),
         backup_dest,
+        amd: None,
         username: model.auth_username.clone(),
         password: model.auth_password.clone(),
         codec: Vec::new(),
@@ -728,10 +730,31 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
             .and_then(|meta| meta.get("sbc"))
             .and_then(|sbc| sbc.get("ice_lite"))
             .and_then(|v| v.as_bool()),
+        passthrough_custom_sdp_attrs: model
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("sbc"))
+            .and_then(|sbc| sbc.get("passthrough_custom_sdp_attrs"))
+            .and_then(|v| v.as_bool()),
+        nat_fix: None,
         profile: None,
         did_numbers: vec![],
         ringback: None,
         max_ring_time: None,
+        max_call_duration: None,
+        retry_policy: None,
+        diversion_headers: model
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("sbc"))
+            .and_then(|sbc| sbc.get("diversion_headers"))
+            .and_then(|v| v.as_bool()),
+        history_info: model
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("sbc"))
+            .and_then(|sbc| sbc.get("history_info"))
+            .and_then(|v| v.as_bool()),
     })
 }
 
@@ -1534,7 +1557,13 @@ pub(crate) async fn evaluate_route_with_snapshots(
     };
 
     let (outcome, caller_render, callee_render, request_render, rewrites) = match result {
-        RouteResult::Forward(option, _) => {
+        // The matcher returns a single target; show the first one.
+        RouteResult::Forward(targets) if !targets.is_empty() => {
+            let option = targets
+                .into_iter()
+                .next()
+                .expect("non-empty targets")
+                .option;
             let rewrites = collect_rewrite_diff(&original_option, &option);
             (
                 RouteOutcomeView::Forward(RouteForwardOutcome {
@@ -1582,6 +1611,13 @@ pub(crate) async fn evaluate_route_with_snapshots(
                 rewrites,
             )
         }
+        RouteResult::Forward(_) => (
+            RouteOutcomeView::NotHandled,
+            original_option.caller.to_string(),
+            original_option.callee.to_string(),
+            request.uri.to_string(),
+            Default::default(),
+        ),
         RouteResult::NotHandled(option, _) => {
             let rewrites = collect_rewrite_diff(&original_option, &option);
             (

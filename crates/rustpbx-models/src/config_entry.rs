@@ -11,6 +11,7 @@ pub struct Model {
     pub id: i64,
     pub category: String,
     pub entry_name: String,
+    /// Generated config document (MEDIUMTEXT since m20261012_000001).
     pub content: String,
     pub is_generated: bool,
     pub created_at: DateTimeUtc,
@@ -43,8 +44,14 @@ impl MigrationTrait for Migration {
                     .col(string_len(Column::EntryName, 255))
                     .col(text(Column::Content))
                     .col(boolean(Column::IsGenerated).default(true))
-                    .col(timestamp(Column::CreatedAt).default(Expr::current_timestamp()))
-                    .col(timestamp(Column::UpdatedAt).default(Expr::current_timestamp()))
+                    .col(
+                        timestamp_with_time_zone(Column::CreatedAt)
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        timestamp_with_time_zone(Column::UpdatedAt)
+                            .default(Expr::current_timestamp()),
+                    )
                     .to_owned(),
             )
             .await?;

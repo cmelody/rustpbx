@@ -224,6 +224,22 @@ default('RustPBX') }}{% endblock %}
                                 placeholder="{{ "sip_trunk_detail.field_outbound_proxy_placeholder" | t }}">
                             <p class="text-xs text-sky-600">Optional intermediary proxy, e.g. proxy.carrier.com:5060</p>
                         </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            {{ "sip_trunk_detail.field_retry_codes" | t }}
+                            <input type="text" x-model.trim="form.retry_status_codes" placeholder="408, 503"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                            <p class="text-xs text-sky-600">{{ "sip_trunk_detail.field_retry_codes_hint" | t }}</p>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            {{ "sip_trunk_detail.field_nat_fix" | t }}
+                            <select x-model="form.nat_fix"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="">Default</option>
+                                <option value="true">Enabled</option>
+                                <option value="false">Disabled</option>
+                            </select>
+                            <p class="text-xs text-sky-600">{{ "sip_trunk_detail.field_nat_fix_hint" | t }}</p>
+                        </label>
                         <div class="flex flex-col gap-2">
                             <span class="text-sm font-medium text-slate-700">{{ "sip_trunk_detail.field_active" | t
                                 }}</span>
@@ -248,6 +264,31 @@ default('RustPBX') }}{% endblock %}
                             class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                             placeholder="{{ "sip_trunk_detail.field_description_placeholder" | t }}"></textarea>
                     </label>
+                </section>
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">{{ "sip_trunk_detail.section_header_passthrough" | t }}</h2>
+                    <p class="mt-1 text-xs text-slate-500">{{ "sip_trunk_detail.section_header_passthrough_desc" | t }}</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            {{ "sip_trunk_detail.field_header_passthrough_mode" | t }}
+                            <select x-model="form.header_passthrough_mode"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="">{{ "sip_trunk_detail.header_passthrough_mode_off" | t }}</option>
+                                <option value="whitelist">{{ "sip_trunk_detail.header_passthrough_mode_whitelist" | t }}</option>
+                                <option value="blacklist">{{ "sip_trunk_detail.header_passthrough_mode_blacklist" | t }}</option>
+                                <option value="x_only">{{ "sip_trunk_detail.header_passthrough_mode_x_only" | t }}</option>
+                                <option value="all">{{ "sip_trunk_detail.header_passthrough_mode_all" | t }}</option>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700"
+                            x-show="form.header_passthrough_mode === 'whitelist' || form.header_passthrough_mode === 'blacklist'">
+                            {{ "sip_trunk_detail.field_header_passthrough_headers" | t }}
+                            <textarea rows="3" x-model="form.header_passthrough_headers"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="P-Early-Media&#10;X-*"></textarea>
+                            <span class="text-xs font-normal text-slate-400">{{ "sip_trunk_detail.field_header_passthrough_headers_hint" | t }}</span>
+                        </label>
+                    </div>
                 </section>
             </div>
 
@@ -305,7 +346,7 @@ default('RustPBX') }}{% endblock %}
 
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                     <h2 class="text-sm font-semibold text-slate-900">{{ "sip_trunk_detail.section_capacity" | t }}</h2>
-                    <div class="mt-4 grid gap-4 md:grid-cols-3">
+                    <div class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                         <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
                             {{ "sip_trunk_detail.field_max_cps" | t }}
                             <input type="number" min="0" step="1" x-model="form.max_cps"
@@ -326,6 +367,13 @@ default('RustPBX') }}{% endblock %}
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="{{ "sip_trunk_detail.field_max_duration_placeholder" | t }}">
                             <p class="text-xs text-sky-600">Max call duration in seconds. 0 = unlimited</p>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            {{ "sip_trunk_detail.field_max_ring_time" | t }}
+                            <input type="number" min="1" step="1" x-model="form.max_ring_time"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="{{ "sip_trunk_detail.max_ring_time_default" | t }}">
+                            <p class="text-xs text-sky-600">{{ "sip_trunk_detail.field_max_ring_time_hint" | t }}</p>
                         </label>
                     </div>
                 </section>
@@ -650,6 +698,9 @@ default('RustPBX') }}{% endblock %}
                 register_extra_headers: '',
                 recording_enabled: '',
                 ice_lite: '',
+                nat_fix: '',
+                retry_status_codes: '',
+                max_ring_time: '',
                 network_profile: '',
                 external_ip_override: '',
                 bind_ip_override: '',
@@ -657,6 +708,8 @@ default('RustPBX') }}{% endblock %}
                 video_policy: '',
                 audio_codecs: '',
                 video_codecs: '',
+                header_passthrough_mode: '',
+                header_passthrough_headers: '',
                 ringback_ring: '',
                 ringback_busy: '',
                 ringback_reject: '',
@@ -735,6 +788,10 @@ default('RustPBX') }}{% endblock %}
                     const sbc = meta.sbc || {};
                     this.form.recording_enabled = typeof sbc.recording_enabled === 'boolean' ? String(sbc.recording_enabled) : '';
                     this.form.ice_lite = typeof sbc.ice_lite === 'boolean' ? String(sbc.ice_lite) : '';
+                    this.form.nat_fix = typeof sbc.nat_fix === 'boolean' ? String(sbc.nat_fix) : '';
+                    const retry = sbc.retry_policy || {};
+                    this.form.retry_status_codes = Array.isArray(retry.status_codes) ? retry.status_codes.join(', ') : '';
+                    this.form.max_ring_time = Number.isInteger(sbc.max_ring_time) && sbc.max_ring_time > 0 ? String(sbc.max_ring_time) : '';
                     this.form.network_profile = typeof sbc.profile === 'string' ? sbc.profile : '';
                     this.form.external_ip_override = typeof sbc.external_ip === 'string' ? sbc.external_ip : '';
                     this.form.bind_ip_override = typeof sbc.bind_ip === 'string' ? sbc.bind_ip : '';
@@ -742,6 +799,21 @@ default('RustPBX') }}{% endblock %}
                     this.form.video_policy = sbc.video_policy || '';
                     this.form.audio_codecs = Array.isArray(sbc.audio_codecs) ? sbc.audio_codecs.join('\n') : '';
                     this.form.video_codecs = Array.isArray(sbc.video_codecs) ? sbc.video_codecs.join('\n') : '';
+                    const hp = sbc.header_passthrough;
+                    if (hp && typeof hp === 'object') {
+                        const whitelist = Array.isArray(hp.whitelist) ? hp.whitelist : [];
+                        const blacklist = Array.isArray(hp.blacklist) ? hp.blacklist : [];
+                        let hpMode = hp.mode || 'all';
+                        // mode=all with a list behaves like that list.
+                        if (hpMode === 'all' && whitelist.length) hpMode = 'whitelist';
+                        else if (hpMode === 'all' && blacklist.length) hpMode = 'blacklist';
+                        this.form.header_passthrough_mode = hpMode;
+                        const hpList = hpMode === 'whitelist' ? whitelist : hpMode === 'blacklist' ? blacklist : [];
+                        this.form.header_passthrough_headers = hpList.join('\n');
+                    } else {
+                        this.form.header_passthrough_mode = '';
+                        this.form.header_passthrough_headers = '';
+                    }
                     const rb = sbc.ringback || {};
                     this.form.ringback_ring = rb.ring || '';
                     this.form.ringback_busy = rb.busy || '';
@@ -932,6 +1004,17 @@ default('RustPBX') }}{% endblock %}
             },
             buildPayload() {
                 const payload = {};
+                const td = (this.t || {}).sip_trunk_detail || {};
+                const retryCodes = this.form.retry_status_codes.split(/[\s,;]+/).filter(Boolean);
+                if (retryCodes.some(code => !/^\d{3}$/.test(code) || Number(code) < 300 || Number(code) > 699)) {
+                    throw new Error(td.error_retry_codes || 'Retry status codes must be SIP failure codes from 300 to 699.');
+                }
+                const retryPolicy = { status_codes: [...new Set(retryCodes.map(Number))] };
+                const maxRingTime = String(this.form.max_ring_time).trim();
+                if (maxRingTime !== '' && !(Number.isSafeInteger(Number(maxRingTime)) && Number(maxRingTime) > 0)) {
+                    throw new Error(td.error_max_ring_time || 'Max ring time must be positive whole seconds or blank.');
+                }
+
                 payload.name = this.form.name.trim();
                 payload.display_name = this.form.display_name.trim();
                 payload.carrier = this.form.carrier.trim();
@@ -984,6 +1067,13 @@ default('RustPBX') }}{% endblock %}
                     } else {
                         delete meta.sbc.ice_lite;
                     }
+                    if (this.form.nat_fix === 'true') {
+                        meta.sbc.nat_fix = true;
+                    } else if (this.form.nat_fix === 'false') {
+                        meta.sbc.nat_fix = false;
+                    } else {
+                        delete meta.sbc.nat_fix;
+                    }
                     if (this.form.media_mode) {
                         meta.sbc.media_mode = this.form.media_mode;
                     } else {
@@ -1021,6 +1111,16 @@ default('RustPBX') }}{% endblock %}
                     } else {
                         delete meta.sbc.video_codecs;
                     }
+                    const hpMode = this.form.header_passthrough_mode;
+                    if (hpMode) {
+                        const hpHeaders = this.form.header_passthrough_headers.split('\n').map(s => s.trim()).filter(s => s);
+                        const hp = { mode: hpMode };
+                        if (hpMode === 'whitelist') hp.whitelist = hpHeaders;
+                        if (hpMode === 'blacklist') hp.blacklist = hpHeaders;
+                        meta.sbc.header_passthrough = hp;
+                    } else {
+                        delete meta.sbc.header_passthrough;
+                    }
                     const ringback = {};
                     if (this.form.ringback_ring.trim()) ringback.ring = this.form.ringback_ring.trim();
                     if (this.form.ringback_busy.trim()) ringback.busy = this.form.ringback_busy.trim();
@@ -1037,6 +1137,17 @@ default('RustPBX') }}{% endblock %}
                         meta.sbc.ringback = ringback;
                     } else {
                         delete meta.sbc.ringback;
+                    }
+                    // No codes means no retry, the same as no policy.
+                    if (retryPolicy.status_codes.length) {
+                        meta.sbc.retry_policy = retryPolicy;
+                    } else {
+                        delete meta.sbc.retry_policy;
+                    }
+                    if (maxRingTime !== '') {
+                        meta.sbc.max_ring_time = Number(maxRingTime);
+                    } else {
+                        delete meta.sbc.max_ring_time;
                     }
                     if (!Object.keys(meta.sbc).length) {
                         delete meta.sbc;

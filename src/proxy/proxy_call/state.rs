@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 pub struct CallSessionRecordSnapshot {
     pub ring_time: Option<Instant>,
     pub answer_time: Option<Instant>,
+    /// See `CallMeta::hangup_time`; `None` ends the record at report time.
+    pub hangup_time: Option<Instant>,
     pub last_error: Option<(StatusCode, Option<String>)>,
     /// Root session id for the whole logical call (first INVITE Call-ID,
     /// inherited across transfers; `None` = this session is the root).
@@ -47,6 +49,10 @@ pub struct CallSessionRecordSnapshot {
     /// Values are JSON so structured entries (e.g. the `trace` array) persist
     /// cleanly into the call-record `metadata` column.
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// AMD (answering machine / AI assistant) detection verdict, when the
+    /// resolved `amd` config enabled detection. Rides `CallDetails.amd` and
+    /// is mirrored into metadata by the reporter.
+    pub amd: Option<crate::media::amd::AmdVerdict>,
     /// Per-leg media quality (packets, RTCP jitter/RTT/loss) captured from the
     /// MediaBridge at call end. Persisted into the call-record `metadata` under
     /// `media_quality`.

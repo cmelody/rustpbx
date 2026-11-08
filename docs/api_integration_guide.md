@@ -46,6 +46,7 @@ RustPBX interacts with external systems in two ways:
   "from": "<sip:1001@pbx.com>",
   "to": "<sip:200@pbx.com>",
   "source_addr": "1.2.3.4:5060",
+  "source_trunk": "carrier-a",  // Trunk the call arrived on; null unless inbound from a trunk
   "direction": "inbound",  // inbound | outbound | internal
   "method": "INVITE",
   "uri": "sip:200@pbx.com",
@@ -80,6 +81,86 @@ RustPBX interacts with external systems in two ways:
 When omitted, the global value is inherited; if neither is set, `media` is the
 default. The field may also be returned without `record` to override the timing
 while retaining the global recording enablement policy.
+
+**Sequential failover and RTP interface selection**:
+
+```json
+{
+  "action": "forward",
+  "strategy": "sequential",
+  "targets": [
+    {"uri": "sip:1001@192.0.2.10:5060", "retry_policy": {"status_codes": [408, 503]}},
+    {
+      "uri": "sip:1001@192.0.2.11:5060",
+      "retry_policy": {"status_codes": []}
+    }
+  ],
+  "media_proxy": "all",
+  "rtp_config": {
+    "bind_ip": "10.0.0.10",
+    "external_ip": "203.0.113.10"
+  }
+}
+```
+
+Targets may mix SIP URI strings and objects containing `uri` and an optional
+`retry_policy`. Retry policies are configured only per target. The
+failed target's policy decides whether to try the next target: `status_codes`
+accepts final SIP failure codes 300–699, and an empty list stops failover.
+A string target or an object without a policy preserves legacy HTTP routing:
+advance after any failure.
+Each target is tried once in order; this does not retry the HTTP webhook request.
+An answer or caller cancellation stops dialing. Parallel dialing rings targets
+concurrently and ignores retry policies. `max_ring_time` bounds the entire
+sequence, while `timeout` limits call duration.
+
+`rtp_config` supports `bind_ip` (the local RTP/SRTP socket interface) and
+`external_ip` (the address advertised in SDP). Both accept IPv4 or IPv6 literals;
+the bind address must exist on the PBX host. Omitted or null fields inherit
+server settings. These are call-wide settings and stay the same across retries.
+Use `media_proxy: "all"` when media must pass through this interface; direct or
+bypass media does not bind a proxy RTP socket. WebRTC continues to gather ICE
+candidates across interfaces and does not use this fixed bind IP. Other RTC
+settings retain their existing server defaults; this object does not expose the
+full RTC configuration. Invalid IPs, unknown `rtp_config` fields or invalid retry codes cause a SIP 500 routing error.
+Malformed target URIs are skipped, preserving existing HTTP routing behavior.
+
+**Trunk targets**: a target can name a configured trunk instead of a URI, and
+the trunk supplies the rest of its configuration:
+
+```json
+{
+  "action": "forward",
+  "strategy": "sequential",
+  "targets": [
+    {"trunk": "carrier-a"},
+    {"trunk": "carrier-b", "callee": "8613800000000"},
+    {"trunk": "carrier-c", "retry_policy": {"status_codes": [503]}}
+  ]
+}
+```
+
+- `trunk` (required) names the trunk. An unknown or disabled trunk fails the
+  call with SIP 500.
+- `callee` (optional) is the number to dial; it defaults to the dialed user. A
+  bare user is qualified with the trunk's destination host.
+- `retry_policy` (optional) overrides the trunk's own
+  [retry policy](trunk-retry.md). Without either, the target never advances,
+  as with any other routed trunk target.
+
+The trunk is applied as the static routing rules apply it: destination and
+transport, credentials, host rewrite, codecs, network profile and media IPs,
+`max_ring_time` and the call record's trunk attribution. In a sequence each
+trunk's `max_ring_time` limits its own attempt; a single trunk target's limits
+the call unless the response sets `max_ring_time`. The response's `caller` and
+`headers` apply to trunk targets too. A target cannot name both `uri` and
+`trunk`. Parallel dialing uses the trunk's destination and credentials only.
+
+For a call that arrived on a trunk (`source_trunk`), that trunk's network path
+(network profile, media IPs, ICE-lite) applies to every sequential target, as
+with static routing; a trunk target's own settings take precedence, and the
+response's `rtp_config` addresses take precedence over both. A profile still
+supplies what `rtp_config` does not set (RTP port range, SIP Contact address).
 
 ### 1.2 User Backend (SIP Authentication)
 Delegate SIP registration password checking to your external DB or API.
@@ -126,7 +207,7 @@ Real-time notification when devices come online or go offline.
 ```json
 {
   "event": "registered",
-  "timestamp": 1708201234,
+  "timestamp": "2026-02-18T00:20:34+08:00",
   "location": {
     "aor": "sip:1001@1.2.3.4:12345",
     "home_proxy": "10.0.0.12:5060",
@@ -146,7 +227,7 @@ can remove multiple bindings at once.
 | Field | Meaning |
 | --- | --- |
 | `event` | `registered`, `unregistered`, or `offline` |
-| `timestamp` | UNIX timestamp in seconds when RustPBX constructs the webhook payload |
+| `timestamp` | RFC 3339 timestamp in the **server's local timezone** (e.g. `+08:00`; `+00:00` when the host has no `TZ`) when RustPBX constructs the webhook payload |
 | `aor` | Device Contact URI from the REGISTER `Contact` header; this is not necessarily the user's canonical identity |
 | `home_proxy` | Advertised SIP address of the RustPBX node that accepted and owns the registration |
 | `destination` | Device network address observed by RustPBX, including transport when available |
@@ -165,7 +246,7 @@ Example `offline` payload:
 ```json
 {
   "event": "offline",
-  "timestamp": 1708201294,
+  "timestamp": "2026-02-18T00:21:34+08:00",
   "locations": [
     {
       "aor": "sip:1001@1.2.3.4:12345",
@@ -371,6 +452,9 @@ media goes: `local` / `http` / `s3` write a WAV (uploaded by `[recording]`);
 `[sipflow.upload].media`). SIP signalling is captured whenever `[sipflow]` is
 configured. `auto_start_at = "media"` (default) installs the recorder after the
 first caller-media setup; use `"answer"` to wait for the final 200.
+`discard_unanswered = true` deletes the WAV recording of a call that was never
+answered (early media only) instead of keeping and uploading it; SipFlow
+captures are not affected.
 
 #### Option 1: Full SipFlow (RTP + SIP)
 
